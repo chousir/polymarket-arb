@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get(\\\"command\\\",\\\"\\\"))\" 2>/dev/null || echo \"\"); echo \"$cmd\" | grep -qE \"(rm -rf /|DROP TABLE|cat (\\.env|\\./.env|/.*\\.env)|git add (\\.env|.*\\.env))\" && echo \"BLOCKED: Dangerous command detected\" && exit 1 || exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|Create",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'file=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get(\\\"path\\\",\\\"\\\"))\" 2>/dev/null || echo \"\"); [ -n \"$file\" ] && [ -f \"$file\" ] && grep -qE \"(PRIVATE_KEY|SECRET|PASSPHRASE)\\s*=\\s*[a-fA-F0-9]{20,}\" \"$file\" 2>/dev/null && echo \"BLOCKED: Hardcoded secret detected in $file\" && exit 1 || exit 0'"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo run*)",
+      "Bash(cargo test*)",
+      "Bash(pytest*)",
+      "Bash(uvicorn*)",
+      "Bash(python -m*)",
+      "Bash(python tools/*)",
+      "Bash(pip install*)",
+      "Bash(git add src/*)",
+      "Bash(git add rust-engine/*)",
+      "Bash(git add python-analytics/*)",
+      "Bash(git add config/settings.toml)",
+      "Bash(git add README.md)",
+      "Bash(git add CLAUDE.md)",
+      "Bash(git commit*)",
+      "Bash(git status)",
+      "Bash(git log*)",
+      "Bash(ls*)",
+      "Bash(tree*)"
+    ],
+    "deny": [
+      "Bash(cat .env*)",
+      "Bash(cat */.env*)",
+      "Bash(cat *.env)",
+      "Bash(git add .env*)",
+      "Bash(git add */.env*)",
+      "Bash(rm -rf /)"
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+.env
+*.env.local
+data/*.db
+data/*.db-shm
+data/*.db-wal
+target/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+*.log
