@@ -1,0 +1,67 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+venv/
+env/
+ENV/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.next/
+dist/
+
+# Rust
+target/
+Cargo.lock
+*.rlib
+*.rmeta
+*.so
+*.dylib
+
+# 文檔 & 草稿
+docs/
+*.md
+/polymarket-arb-plan.md
+/CLAUDE.md
+/README.md
+
+# 敏感檔案（即使 .gitignore 已列出）
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# 測試與覆蓋
+coverage/
+.coverage
+
+# 數據（本機 dry_run）
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker 相關
+docker-compose.override.yml

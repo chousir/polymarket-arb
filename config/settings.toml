@@ -1,29 +1,506 @@
-[trading]
-mode = "dry_run"
-monitor_window_sec = 120
-dump_threshold_pct = 0.15
-hedge_threshold_sum = 0.93
-min_token_price = 0.05
-max_token_price = 0.95
-bet_size_usdc = 10.0
-max_position_usdc = 200.0
-hedge_wait_limit_sec = 180
-abort_before_close_sec = 30
+# ═══════════════════════════════════════════════════════════════════════════════
+# Polymarket Arb — 全域設定
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[global]
+mode                    = "dry_run"      # "dry_run" | "live"
+monitor_window_sec      = 120
+abort_before_close_sec  = 30
 
 [api]
-gamma_base = "https://gamma-api.polymarket.com"
-clob_base = "https://clob.polymarket.com"
-ws_market_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-binance_ws_url = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
-chain_id = 137
+gamma_base      = "https://gamma-api.polymarket.com"
+clob_base       = "https://clob.polymarket.com"
+ws_market_url   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+binance_ws_url  = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+chain_id        = 137
+# Polygon 公共 RPC（live 模式查詢 USDC 餘額用）
+polygon_rpc_url = "https://polygon-rpc.com"
 
 [rate_limits]
-orders_per_second = 60
-books_per_10s = 5
-max_ws_connections = 5
-retry_base_ms = 1000
-retry_max_attempts = 3
+orders_per_second   = 60
+books_per_10s       = 5
+max_ws_connections  = 5
+retry_base_ms       = 1000
+retry_max_attempts  = 3
 
 [risk]
-max_daily_loss_usdc = 50.0
-circuit_breaker_loss_pct = 0.20
+max_daily_loss_usdc       = 50.0
+circuit_breaker_loss_pct  = 0.20
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 資金管理（全域）
+# ───────────────────────────────────────────────────────────────────────────────
+# initial_capital_usdc：模擬總資金（dry_run）；live 模式啟動時會自動查詢鏈上餘額
+# taker_fee_pct      ：Polymarket taker fee（最高 1.80%，加密市場）
+# gas_fee_usdc       ：每筆交易 Polygon gas 費（約 $0.005）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[capital]
+initial_capital_usdc = 10000.0
+taker_fee_pct        = 0.018
+gas_fee_usdc         = 0.005
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 策略清單
+# ───────────────────────────────────────────────────────────────────────────────
+# type：
+#   "dump_hedge" — Leg1 等 BTC 急跌後買 Up，Leg2 等 sum 低於閾值再對沖。
+#   "pure_arb"   — 直接監控 sum < hedge_threshold_sum，同時買兩腿。
+#
+# 資金管理參數（每個策略獨立）：
+#   capital_allocation_pct  — 使用 initial_capital 的幾%（0.20 = 20% = 100 USDC）
+#   trade_size_pct          — 每次下注使用可用資金的幾%（0.10 = 10%）
+#   max_drawdown_pct        — 虧損達此比例後停止入場（0.30 = 30%）
+#
+# 注意：每次實際下注金額 = current_capital × trade_size_pct（動態，隨資金消長）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Dump-Hedge 系列 ────────────────────────────────────────────────────────────
+
+[[strategies]]
+id                      = "dump_hedge_conservative"
+type                    = "dump_hedge"
+enabled                 = false
+dump_threshold_pct      = 0.15
+hedge_threshold_sum     = 0.93
+capital_allocation_pct  = 0.05      # 使用 5% 總資金
+trade_size_pct          = 0.05      # 每次投 5% 可用金
+max_drawdown_pct        = 0.30
+hedge_wait_limit_sec    = 180
+min_token_price         = 0.05
+max_token_price         = 0.95
+
+[[strategies]]
+id                      = "dump_hedge_medium"
+type                    = "dump_hedge"
+enabled                 = false
+dump_threshold_pct      = 0.10
+hedge_threshold_sum     = 0.94
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.30
+hedge_wait_limit_sec    = 240
+min_token_price         = 0.05
+max_token_price         = 0.95
+
+[[strategies]]
+id                      = "dump_hedge_aggressive"
+type                    = "dump_hedge"
+enabled                 = false
+dump_threshold_pct      = 0.05
+hedge_threshold_sum     = 0.95
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.30
+hedge_wait_limit_sec    = 300
+min_token_price         = 0.05
+max_token_price         = 0.95
+
+# ── Pure-Arb 系列 ──────────────────────────────────────────────────────────────
+
+[[strategies]]
+id                      = "pure_arb_tight"
+type                    = "pure_arb"
+enabled                 = false
+dump_threshold_pct      = 0.0
+hedge_threshold_sum     = 0.93
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.30
+hedge_wait_limit_sec    = 0
+min_token_price         = 0.05
+max_token_price         = 0.95
+
+[[strategies]]
+id                      = "pure_arb_loose"
+type                    = "pure_arb"
+enabled                 = false
+dump_threshold_pct      = 0.0
+hedge_threshold_sum     = 0.96      # 注意：此閾值在費用後利潤極薄（~0.4%）
+capital_allocation_pct  = 0.05      # 分配較少資金給高風險設定
+trade_size_pct          = 0.10
+max_drawdown_pct        = 0.20      # 更嚴格的停損
+hedge_wait_limit_sec    = 0
+min_token_price         = 0.05
+max_token_price         = 0.95
+
+# ── Mention Market 系列（Phase 4）──────────────────────────────────────────────
+# type = "mention"：川普提及詞市場，NO/YES 雙路徑，按淨邊際決策。
+#
+# 成本計算（每次入場）：
+#   total_cost_frac = (taker_fee_bps + slippage_buffer_bps + execution_risk_bps) / 10_000
+#   edge            = (1 − entry_price) − total_cost_frac
+#   入場條件        : edge >= min_net_edge_bps / 10_000
+#
+# direction_mode 選項：
+#   "no_first"  — NO 有邊際先執行；否則嘗試 YES
+#   "yes_first" — YES 有邊際先執行；否則嘗試 NO
+#   "no_only"   — 只交易 NO token
+#   "yes_only"  — 只交易 YES token
+#
+# 灰度上線順序（Step 4-4）：
+#   Week 1 → 只啟用 mention_no_gradual_w1（1 keyword，最小倉）
+#   Week 2 → 連續 7 天成本後為正後，啟用 mention_no_standard 或 mention_yes_auxiliary
+#   進階   → ≥ 14 天正收益後，才考慮 mention_no_first_combined
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Week 1 灰度：單 keyword（crypto），超嚴格參數，小倉驗證執行品質
+[[strategies]]
+id                      = "mention_no_gradual_w1"
+type                    = "mention"
+enabled                 = false             # Phase 4 正式實現前保持禁用
+direction_mode          = "no_only"          # Week 1 只做 NO 主策略
+active_keyword_count    = 1                  # 只開 1 個 keyword（crypto）
+capital_allocation_pct  = 0.05              # 使用 5% 總資金（灰度）
+trade_size_pct          = 0.05              # 每次只用可用資金 5%
+max_drawdown_pct        = 0.15              # 嚴格：15% 回撤即停止入場
+entry_no_min_price      = 0.05
+entry_yes_max_price     = 0.30              # 不適用（no_only），保守備用
+take_profit_no_price    = 0.85
+take_profit_yes_price   = 0.80              # 不適用（no_only）
+stop_loss_delta         = 0.08              # 比預設更緊（0.10 → 0.08）
+taker_fee_bps           = 180.0
+slippage_buffer_bps     = 80.0              # 灰度期間多留緩衝（預設 50）
+execution_risk_bps      = 30.0
+min_net_edge_bps        = 200.0             # 嚴格門檻（預設 100 → 200 bps）
+max_spread              = 0.04
+
+# Week 2+：NO 主策略標準版（連續 7 天正收益後啟用）
+[[strategies]]
+id                      = "mention_no_standard"
+type                    = "mention"
+enabled                 = false             # Phase 4 正式實現前保持禁用
+direction_mode          = "no_only"
+active_keyword_count    = 3                  # 最多 3 個 NO 關鍵詞
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.20
+entry_no_min_price      = 0.05
+entry_yes_max_price     = 0.40              # 不適用（no_only）
+take_profit_no_price    = 0.80
+take_profit_yes_price   = 0.80              # 不適用（no_only）
+stop_loss_delta         = 0.10
+taker_fee_bps           = 180.0
+slippage_buffer_bps     = 50.0
+execution_risk_bps      = 20.0
+min_net_edge_bps        = 150.0
+max_spread              = 0.05
+
+# Week 2+：YES 輔策略（rhetorical staples，連續 7 天正收益後啟用）
+[[strategies]]
+id                      = "mention_yes_auxiliary"
+type                    = "mention"
+enabled                 = false             # Phase 4 正式實現前保持禁用
+direction_mode          = "yes_only"
+active_keyword_count    = 2                  # 最多 2 個 YES 關鍵詞
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.20
+entry_no_min_price      = 0.05              # 不適用（yes_only）
+entry_yes_max_price     = 0.35              # 比預設 0.40 更嚴（YES 入場最高價）
+take_profit_no_price    = 0.80              # 不適用（yes_only）
+take_profit_yes_price   = 0.85
+stop_loss_delta         = 0.10
+taker_fee_bps           = 180.0
+slippage_buffer_bps     = 50.0
+execution_risk_bps      = 20.0
+min_net_edge_bps        = 150.0
+max_spread              = 0.05
+
+# 進階：NO 優先雙向策略（需至少 14 天正收益後才考慮啟用）
+[[strategies]]
+id                      = "mention_no_first_combined"
+type                    = "mention"
+enabled                 = false             # Phase 4 正式實現前保持禁用
+direction_mode          = "no_first"         # NO 有邊際先執行；否則嘗試 YES
+active_keyword_count    = 5
+capital_allocation_pct  = 0.05
+trade_size_pct          = 0.05
+max_drawdown_pct        = 0.25
+entry_no_min_price      = 0.05
+entry_yes_max_price     = 0.40
+take_profit_no_price    = 0.80
+take_profit_yes_price   = 0.80
+stop_loss_delta         = 0.10
+taker_fee_bps           = 180.0
+slippage_buffer_bps     = 50.0
+execution_risk_bps      = 20.0
+min_net_edge_bps        = 100.0
+max_spread              = 0.05
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 4 灰度上線控制（Step 4-4）
+# ───────────────────────────────────────────────────────────────────────────────
+# enabled_keywords_week1 ：Week 1 只開哪個關鍵詞（crypto = NO 主策略最穩定）
+# min_profitable_days    ：連續多少天成本後為正才允許升級到下一階段
+# auto_rollback_on_risk  ：任一風控觸發後自動退回 dry_run
+# daily_loss_limit_usdc  ：日虧損上限（獨立於 [risk].max_daily_loss_usdc，更嚴格）
+# latency_alert_ms       ：異常延遲閾值，超過即觸發退回 dry_run
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Weather Market 系列（Phase 5）
+# ───────────────────────────────────────────────────────────────────────────────
+# type = "weather"：科學氣象模型 vs 群眾直覺，尋找邊際並下注。
+#
+# 成本計算（每次入場）：
+#   cost_frac = (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2
+#   edge      = model_p_yes − market_ask − cost_frac
+#   入場條件  : edge >= min_net_edge_bps / 10_000
+#
+# 動態平倉觸發：
+#   TAKE_PROFIT      — 持倉 bid ≥ 入場價 + 目標利潤
+#   STOP_LOSS        — 持倉 ask ≤ 入場價 − stop_loss_delta
+#   TIME_DECAY_EXIT  — 距收盤 < abort_before_close_sec
+#   FORECAST_SHIFT   — 新預測 p_yes 偏移 ≥ forecast_shift_threshold
+#
+# 城市白名單（city_whitelist）：
+#   空陣列 = 接受所有支援城市（NYC, London, Miami, Chicago, LA, Paris,
+#             Tokyo, Sydney, Toronto, Dubai）
+#   指定陣列 = 只交易列出的城市
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 灰度：單城市（NYC），嚴格參數，驗證 GFS 邊際品質
+[[strategies]]
+id                          = "weather_nyc_gfs_v1"
+type                        = "weather"
+enabled                     = true             # Phase 5 驗證後啟用
+capital_allocation_pct      = 0.05              # 使用 5% 總資金（灰度）
+trade_size_pct              = 0.05              # 每次只用可用資金 5%
+max_drawdown_pct            = 0.20
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 60.0             # 天氣市場流動性較低，多留緩衝
+min_net_edge_bps            = 1000.0            # 嚴格：10% 邊際才入場
+max_spread                  = 0.06
+stop_loss_delta             = 0.06
+min_model_confidence        = 0.65             # 模型信心需 ≥ 65% 或 ≤ 35%
+weather_min_depth_usdc      = 75.0             # 比預設更高的流動性門檻
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7                # 只交易 7 天內（GFS 有效範圍）
+city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Houston", "Dallas", "Boston", "Seattle", "Atlanta"]
+weather_forecast_model      = "gfs"
+forecast_shift_threshold    = 0.15
+
+# 美國限定：只使用 NWS/NOAA 覆蓋的城市
+[[strategies]]
+id                          = "weather_nws_direct"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.25
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 800.0
+max_spread                  = 0.05
+stop_loss_delta             = 0.06
+min_model_confidence        = 0.65
+weather_min_depth_usdc      = 75.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7
+city_whitelist              = ["NYC", "Miami", "Chicago", "LA", "Houston", "Phoenix", "San Francisco", "Boston", "Seattle", "Atlanta", "Dallas", "Denver"]
+weather_forecast_model      = "nws"
+forecast_shift_threshold    = 0.15
+
+# 標準版：多城市，ECMWF 精度範圍（2–5 天），中等閾值
+[[strategies]]
+id                          = "weather_ecmwf_global"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.25
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 800.0
+max_spread                  = 0.07
+stop_loss_delta             = 0.07
+min_model_confidence        = 0.62
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 2
+weather_max_lead_days       = 5                # ECMWF 最佳精度範圍
+city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Tokyo", "Sydney", "Paris", "Toronto", "Dubai", "Seoul", "Boston", "Houston"]
+weather_forecast_model      = "ecmwf"
+forecast_shift_threshold    = 0.12             # 更敏感的平倉觸發
+
+# Ensemble 機率版：直接用 50+ 成員統計 p_yes（高流動性城市優先）
+[[strategies]]
+id                          = "weather_ensemble_prob"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.25
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 1000.0           # 較高門檻，確保扣成本後仍有優勢
+max_spread                  = 0.06
+stop_loss_delta             = 0.12
+min_model_confidence        = 0.70
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7
+city_whitelist              = ["NYC", "London", "Tokyo", "Miami", "Chicago", "LA", "Sydney", "Toronto", "Paris", "Dubai"]
+weather_forecast_model      = "ensemble"
+forecast_shift_threshold    = 0.12
+
+# 多模型共識版：僅在 GFS/ECMWF/Ensemble 三者分歧 < 10% 時進場
+[[strategies]]
+id                          = "weather_multi_consensus"
+type                        = "weather"
+enabled                     = false            # 改用 A/B 兩組參數版
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.20
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 600.0
+max_spread                  = 0.06
+stop_loss_delta             = 0.15
+min_model_confidence        = 0.60
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7
+city_whitelist              = ["NYC", "London"]
+weather_forecast_model      = "consensus"
+forecast_shift_threshold    = 0.15
+consensus_max_divergence    = 0.10
+
+# A/B 測試 A 組（保守）：高邊際 + 高信心 + 嚴格流動性
+[[strategies]]
+id                          = "weather_multi_consensus_conservative"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.04
+max_drawdown_pct            = 0.18
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 60.0
+min_net_edge_bps            = 900.0
+max_spread                  = 0.05
+stop_loss_delta             = 0.12
+min_model_confidence        = 0.68
+weather_min_depth_usdc      = 80.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7
+city_whitelist              = ["NYC", "London", "Miami", "Chicago", "Tokyo", "Sydney"]
+weather_forecast_model      = "consensus"
+forecast_shift_threshold    = 0.12
+consensus_max_divergence    = 0.08
+
+
+# A/B 測試 B 組（進取）：低邊際 + 較寬流動性門檻，提升進場頻率
+[[strategies]]
+id                          = "weather_multi_consensus_aggressive"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.07
+max_drawdown_pct            = 0.22
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 45.0
+min_net_edge_bps            = 500.0
+max_spread                  = 0.07
+stop_loss_delta             = 0.18
+min_model_confidence        = 0.58
+weather_min_depth_usdc      = 40.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 7
+city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Tokyo", "Sydney", "Paris", "Toronto", "Dubai"]
+weather_forecast_model      = "consensus"
+forecast_shift_threshold    = 0.18
+consensus_max_divergence    = 0.15
+
+# METAR 短線版：METAR 即時觀測 + NWS/GFS 短期預測，只做 24h 內到期市場
+[[strategies]]
+id                          = "weather_metar_short"
+type                        = "weather"
+enabled                     = false            # 改用 A/B 兩組參數版
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.20
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 60.0
+min_net_edge_bps            = 700.0
+max_spread                  = 0.07
+stop_loss_delta             = 0.10
+min_model_confidence        = 0.62
+weather_min_depth_usdc      = 60.0
+weather_min_lead_days       = 0
+weather_max_lead_days       = 1
+city_whitelist              = []               # 空陣列 = 所有支援且有 ICAO 的城市
+weather_forecast_model      = "metar_short"
+forecast_shift_threshold    = 0.10
+loop_interval_sec           = 300
+
+# A/B 測試 A 組（保守）：提高邊際與流動性門檻，降低回撤
+[[strategies]]
+id                          = "weather_metar_short_conservative"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.04
+max_drawdown_pct            = 0.18
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 65.0
+min_net_edge_bps            = 900.0
+max_spread                  = 0.06
+stop_loss_delta             = 0.09
+min_model_confidence        = 0.68
+weather_min_depth_usdc      = 80.0
+weather_min_lead_days       = 0
+weather_max_lead_days       = 1
+city_whitelist              = []               # 所有支援且有 ICAO 的城市
+weather_forecast_model      = "metar_short"
+forecast_shift_threshold    = 0.08
+loop_interval_sec           = 300
+
+# A/B 測試 B 組（進取）：降低進場門檻，提高進場頻率
+[[strategies]]
+id                          = "weather_metar_short_aggressive"
+type                        = "weather"
+enabled                     = true
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.07
+max_drawdown_pct            = 0.24
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 500.0
+max_spread                  = 0.08
+stop_loss_delta             = 0.13
+min_model_confidence        = 0.58
+weather_min_depth_usdc      = 40.0
+weather_min_lead_days       = 0
+weather_max_lead_days       = 1
+city_whitelist              = []               # 所有支援且有 ICAO 的城市
+weather_forecast_model      = "metar_short"
+forecast_shift_threshold    = 0.12
+loop_interval_sec           = 300
+
+# 進階：全城市，允許更長預測期（需 ≥ 14 天穩定正收益後才考慮）
+[[strategies]]
+id                          = "weather_global_v1"
+type                        = "weather"
+enabled                     = false
+capital_allocation_pct      = 0.05
+trade_size_pct              = 0.05
+max_drawdown_pct            = 0.25
+taker_fee_bps               = 180.0
+slippage_buffer_bps         = 50.0
+min_net_edge_bps            = 600.0
+max_spread                  = 0.08
+stop_loss_delta             = 0.08
+min_model_confidence        = 0.60
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 1
+weather_max_lead_days       = 10
+city_whitelist              = []               # 空陣列 = 接受所有支援城市
+weather_forecast_model      = "gfs"
+forecast_shift_threshold    = 0.15
+
+[mention_live_gradual]
+enabled_keywords_week1  = ["crypto"]        # Week 1 只開 1 個 keyword
+min_profitable_days     = 7                 # 升級條件：連續 7 天成本後為正
+auto_rollback_on_risk   = true              # 風控觸發立即退回 dry_run
+daily_loss_limit_usdc   = 20.0             # 日虧損上限（比 [risk] 更嚴格）
+latency_alert_ms        = 2000             # 異常延遲閾值（ms）

@@ -1,4 +1,37 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo run*)",
+      "Bash(cargo test*)",
+      "Bash(pytest*)",
+      "Bash(uvicorn*)",
+      "Bash(python -m*)",
+      "Bash(python tools/*)",
+      "Bash(pip install*)",
+      "Bash(git add src/*)",
+      "Bash(git add rust-engine/*)",
+      "Bash(git add python-analytics/*)",
+      "Bash(git add config/settings.toml)",
+      "Bash(git add README.md)",
+      "Bash(git add CLAUDE.md)",
+      "Bash(git commit*)",
+      "Bash(git status)",
+      "Bash(git log*)",
+      "Bash(ls*)",
+      "Bash(tree*)",
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s -v \"https://aviationweather.gov/api/data/metar?ids=CYYZ&format=json&hours=3\")"
+    ],
+    "deny": [
+      "Bash(cat .env*)",
+      "Bash(cat */.env*)",
+      "Bash(cat *.env)",
+      "Bash(git add .env*)",
+      "Bash(git add */.env*)",
+      "Bash(rm -rf /)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -21,37 +54,6 @@
           }
         ]
       }
-    ]
-  },
-  "permissions": {
-    "allow": [
-      "Bash(cargo build*)",
-      "Bash(cargo run*)",
-      "Bash(cargo test*)",
-      "Bash(pytest*)",
-      "Bash(uvicorn*)",
-      "Bash(python -m*)",
-      "Bash(python tools/*)",
-      "Bash(pip install*)",
-      "Bash(git add src/*)",
-      "Bash(git add rust-engine/*)",
-      "Bash(git add python-analytics/*)",
-      "Bash(git add config/settings.toml)",
-      "Bash(git add README.md)",
-      "Bash(git add CLAUDE.md)",
-      "Bash(git commit*)",
-      "Bash(git status)",
-      "Bash(git log*)",
-      "Bash(ls*)",
-      "Bash(tree*)"
-    ],
-    "deny": [
-      "Bash(cat .env*)",
-      "Bash(cat */.env*)",
-      "Bash(cat *.env)",
-      "Bash(git add .env*)",
-      "Bash(git add */.env*)",
-      "Bash(rm -rf /)"
     ]
   }
 }

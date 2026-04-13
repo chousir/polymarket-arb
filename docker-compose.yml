@@ -1,0 +1,129 @@
+version: '3.8'
+
+services:
+  # ════════════════════════════════════════════════════════════════════════════
+  # Polymarket 核心引擎（Rust）
+  # ════════════════════════════════════════════════════════════════════════════
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-engine
+    environment:
+      # 交易模式（dry_run / live）
+      TRADING_MODE: ${TRADING_MODE:-dry_run}
+      SERVICE_MODE: 0  # 只運行引擎
+      
+      # 資料庫路徑
+      DB_PATH: /app/data/market_snapshots.db
+      
+      # 日誌級別
+      RUST_LOG: ${RUST_LOG:-info,polymarket_engine=debug}
+      
+      # Polygon 簽名（必填）
+      POLYGON_PRIVATE_KEY: ${POLYGON_PRIVATE_KEY:-}
+      POLYGON_PUBLIC_KEY: ${POLYGON_PUBLIC_KEY:-}
+      
+      # CLOB API（必填）
+      CLOB_API_KEY: ${CLOB_API_KEY:-}
+      CLOB_API_SECRET: ${CLOB_API_SECRET:-}
+      CLOB_API_PASSPHRASE: ${CLOB_API_PASSPHRASE:-}
+      
+      # Telegram 通知（可選）
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      
+      # Live 模式確認
+      CONFIRM_LIVE: ${CONFIRM_LIVE:-}
+    
+    volumes:
+      # 數據持久化
+      - ./data:/app/data
+      # 配置（唯讀掛載）
+      - ./config:/app/config:ro
+    
+    networks:
+      - polymarket-net
+    
+    restart: on-failure:5
+    
+    # 僅在 Live 模式開啟（防誤觸）
+    profiles:
+      - engine
+      - all
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Python 儀表板 + 分析層
+  # ════════════════════════════════════════════════════════════════════════════
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-dashboard
+    environment:
+      DB_PATH: /app/data/market_snapshots.db
+      SERVICE_MODE: 1  # 只運行儀表板
+    
+    volumes:
+      - ./data:/app/data:ro
+      - ./config:/app/config:ro
+    
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    
+    networks:
+      - polymarket-net
+    
+    depends_on:
+      - engine
+    
+    restart: unless-stopped
+    
+    profiles:
+      - dashboard
+      - all
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 整合服務（Rust 引擎 + 儀表板）
+  # ════════════════════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-app
+    environment:
+      TRADING_MODE: ${TRADING_MODE:-dry_run}
+      SERVICE_MODE: 2  # 同時啟動引擎 + 儀表板
+      
+      DB_PATH: /app/data/market_snapshots.db
+      RUST_LOG: ${RUST_LOG:-info,polymarket_engine=debug}
+      
+      POLYGON_PRIVATE_KEY: ${POLYGON_PRIVATE_KEY:-}
+      POLYGON_PUBLIC_KEY: ${POLYGON_PUBLIC_KEY:-}
+      CLOB_API_KEY: ${CLOB_API_KEY:-}
+      CLOB_API_SECRET: ${CLOB_API_SECRET:-}
+      CLOB_API_PASSPHRASE: ${CLOB_API_PASSPHRASE:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      CONFIRM_LIVE: ${CONFIRM_LIVE:-}
+    
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    
+    networks:
+      - polymarket-net
+    
+    restart: on-failure:5
+    
+    profiles:
+      - all
+
+networks:
+  polymarket-net:
+    driver: bridge
+
+volumes:
+  polymarket-data:
+    driver: local

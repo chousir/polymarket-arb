@@ -3,7 +3,24 @@
     "allow": [
       "Bash(cargo build:*)",
       "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs)",
-      "Bash(sh -s -- -y --no-modify-path)"
+      "Bash(sh -s -- -y --no-modify-path)",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets?slug=btc-updown-15m-1775893500\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(pip3 show:*)",
+      "Bash(find /home/user/polymarket-arb/python-analytics -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'{len\\(d\\)} rows'\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'{len\\(d\\)} days'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"GET /  → HTTP %{http_code}\\\\n\" http://localhost:8080/)",
+      "Bash(pkill -f uvicorn)",
+      "Bash(nohup uvicorn:*)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(wait)",
+      "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db \".tables\")",
+      "Bash(sqlite3 /home/user/polymarket-arb/rust-engine/data/market_snapshots.db 'SELECT COUNT\\(DISTINCT DATE\\(ts\\)\\) as distinct_days FROM dry_run_trades;')",
+      "Bash(python -c \"from src.dashboard.app import app; print\\('OK'\\)\")",
+      "Bash(python -c \"from src.dashboard.app import app; routes = [r.path for r in app.routes]; [print\\(r\\) for r in sorted\\(routes\\) if 'mention' in r or 'strategy' in r]\")",
+      "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db \"SELECT action, COUNT\\(*\\) FROM weather_dry_run_trades GROUP BY action;\")",
+      "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db ':*)"
     ]
   }
 }

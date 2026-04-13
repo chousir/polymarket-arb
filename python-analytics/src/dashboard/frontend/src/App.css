@@ -1,0 +1,348 @@
+/* ── Reset + base ────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: #0f0f1a;
+  color: #e2e8f0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 16px 60px;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #f1f5f9;
+}
+
+.mode-badge {
+  font-size: 11px;
+  font-weight: 600;
+  background: #312e81;
+  color: #a5b4fc;
+  padding: 2px 8px;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+/* WebSocket status dot */
+.ws-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.ws-connecting { background: #fbbf24; }
+.ws-live       { background: #34d399; box-shadow: 0 0 6px #34d399; }
+.ws-offline    { background: #f87171; }
+
+/* ── Stat cards ──────────────────────────────────────────────────────────── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: #1e1e2e;
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #64748b;
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  color: #f1f5f9;
+  line-height: 1.2;
+}
+
+.stat-sub {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 4px;
+}
+
+/* ── Panels ──────────────────────────────────────────────────────────────── */
+.panel {
+  background: #1e1e2e;
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.panel h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #94a3b8;
+  margin-bottom: 16px;
+}
+
+.count {
+  font-weight: 400;
+  color: #475569;
+}
+
+.empty {
+  color: #475569;
+  font-style: italic;
+  font-size: 13px;
+}
+
+/* ── Tables ──────────────────────────────────────────────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #475569;
+  border-bottom: 1px solid #2a2a3a;
+  padding: 8px 10px;
+  white-space: nowrap;
+}
+
+td {
+  padding: 7px 10px;
+  border-bottom: 1px solid #1a1a2a;
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #252535; }
+
+.row-selected td {
+  background: #2a2a45;
+}
+
+.row-win  td { border-left: 2px solid #34d399; }
+.row-loss td { border-left: 2px solid #f87171; }
+
+.green { color: #34d399; }
+.red   { color: #f87171; }
+.slug  { font-family: monospace; font-size: 11px; color: #94a3b8; }
+.ts    { font-family: monospace; font-size: 11px; color: #475569; }
+
+.btn-link {
+  background: transparent;
+  border: 1px solid #475569;
+  color: #cbd5e1;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.btn-link:hover {
+  border-color: #64748b;
+  background: #303044;
+}
+
+.detail-cards {
+  margin-bottom: 16px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.detail-grid h3 {
+  font-size: 13px;
+  color: #94a3b8;
+  margin-bottom: 8px;
+}
+
+@media (max-width: 900px) {
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid #2a2a3a;
+  padding-bottom: 0;
+}
+
+.tab-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 16px 12px;
+  cursor: pointer;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: -1px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+  color: #94a3b8;
+}
+
+.tab-active {
+  color: #e2e8f0 !important;
+  border-bottom-color: #a78bfa !important;
+}
+
+.tab-sub {
+  font-size: 10px;
+  font-weight: 400;
+  color: #475569;
+  letter-spacing: 0.03em;
+}
+
+.tab-active .tab-sub {
+  color: #7c6faa;
+}
+
+/* ── Tag list (keywords / markets) ──────────────────────────────────────── */
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.tag {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: monospace;
+}
+
+.tag-keyword {
+  background: #1e1e3a;
+  color: #a5b4fc;
+  border: 1px solid #3730a3;
+}
+
+.tag-market {
+  background: #1a2a1a;
+  color: #6ee7b7;
+  border: 1px solid #166534;
+  font-size: 10px;
+}
+
+/* ── Section divider ─────────────────────────────────────────────────────── */
+.section-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 32px 0 20px;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.section-divider::before,
+.section-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: #2a2a3a;
+}
+.section-divider span {
+  white-space: nowrap;
+  color: #a78bfa;
+}
+
+/* ── Rejection breakdown ─────────────────────────────────────────────────── */
+.rejection-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.rejection-card {
+  background: #16162a;
+  border: 1px solid #2a2a3a;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.rejection-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #64748b;
+  margin-bottom: 4px;
+}
+
+.rejection-value {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.rejection-bar {
+  height: 4px;
+  background: #2a2a3a;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.rejection-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+.red-fill { background: #f87171; }
+
+@media (max-width: 700px) {
+  .rejection-grid {
+    grid-template-columns: 1fr;
+  }
+}

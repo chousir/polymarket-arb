@@ -1,0 +1,28 @@
+# docker-compose.override.yml — 本機開發配置（可選）
+#
+# 複製此檔為 docker-compose.override.yml，自動被 docker-compose 載入
+# 用於開發環境調整（更高的日誌等級、volume mount 等）
+
+version: '3.8'
+
+services:
+  app:
+    # 本機開發掛載原始碼（允許 cargo watch / uvicorn reload）
+    volumes:
+      - ./rust-engine:/app/rust-engine:ro
+      - ./python-analytics:/app/python-analytics:ro
+      - ./config:/app/config:ro
+    
+    # 本機 3 個埠：儀表板 8080、Rust debug 9090、Python uvicorn reload
+    environment:
+      RUST_LOG: debug,polymarket_engine=trace
+
+  engine:
+    # 便於本機 cargo watch 監測
+    environment:
+      RUST_LOG: debug,polymarket_engine=trace
+
+  dashboard:
+    # 便於本機檢視 API 日誌
+    environment:
+      LOG_LEVEL: debug

@@ -1,8 +1,9 @@
 .env
 *.env.local
-data/*.db
-data/*.db-shm
-data/*.db-wal
+.env.docker
+**/data/*.db
+**/data/*.db-shm
+**/data/*.db-wal
 target/
 __pycache__/
 *.pyc

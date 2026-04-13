@@ -21,3 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
 config = "0.14"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+sha3    = "0.10"
+k256    = { version = "0.13", features = ["ecdsa"] }
+base64  = "0.22"
