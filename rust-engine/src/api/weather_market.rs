@@ -33,8 +33,11 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
 
-// tag_slug used by the Gamma Events API for temperature markets
-const TAG_SLUG: &str = "temperature";
+// tag_slug used by the Gamma Events API for temperature markets.
+// "daily-temperature" is a superset of the old "temperature" tag and correctly
+// covers all active city daily-temperature events (e.g. Paris Apr 19 only has
+// "daily-temperature", not "temperature").
+const TAG_SLUG: &str = "daily-temperature";
 
 // ── Shared HTTP client ────────────────────────────────────────────────────────
 
@@ -100,6 +103,8 @@ pub struct WeatherMarket {
     pub token_id_no: String,
     /// Unix timestamp (seconds) when the market closes / resolves
     pub close_ts: u64,
+    /// CLOB liquidity (USDC), from Gamma API liquidityClob field
+    pub liquidity_clob: f64,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -257,6 +262,17 @@ pub(crate) fn parse_city(question: &str) -> String {
         // ── Oceania ────────────────────────────────────────────────────────
         ("sydney",          "Sydney"),
         ("melbourne",       "Melbourne"),
+        // ── Extended cities ────────────────────────────────────────────────
+        ("beijing",         "Beijing"),
+        ("moscow",          "Moscow"),
+        ("sao paulo",       "São Paulo"),
+        ("buenos aires",    "Buenos Aires"),
+        ("ankara",          "Ankara"),
+        ("wellington",      "Wellington"),
+        ("munich",          "Munich"),
+        ("tel aviv",        "Tel Aviv"),
+        ("austin",          "Austin"),
+        ("lucknow",         "Lucknow"),
         // ── Abbreviations — checked last ───────────────────────────────────
         (" la ",            "LA"),
         ("(la)",            "LA"),
@@ -404,8 +420,8 @@ pub(crate) fn parse_market_type(question: &str) -> WeatherMarketType {
     if !temps.is_empty() {
         let extreme_kws = [
             "exceed", "exceeds", "above", "below", "over", "under",
-            "higher than", "lower than", "at least", "heat wave",
-            "record", "freeze", "freezing",
+            "higher than", "lower than", "or higher", "or above",
+            "at least", "heat wave", "record", "freeze", "freezing",
         ];
         if extreme_kws.iter().any(|kw| q.contains(kw)) {
             return WeatherMarketType::Extreme;
@@ -416,6 +432,11 @@ pub(crate) fn parse_market_type(question: &str) -> WeatherMarketType {
     let extreme_only_kws = ["heat wave", "cold snap", "freeze", "blizzard", "polar vortex"];
     if extreme_only_kws.iter().any(|kw| q.contains(kw)) {
         return WeatherMarketType::Extreme;
+    }
+
+    // Single exact-temperature market (e.g. "Will highest temp be 24°C?")
+    if !temps.is_empty() {
+        return WeatherMarketType::TempRange;
     }
 
     WeatherMarketType::Unknown
@@ -468,6 +489,8 @@ struct GammaEventMarket {
     clob_token_ids: Option<String>,
     #[serde(rename = "endDate")]
     end_date: Option<String>,
+    #[serde(rename = "liquidityClob", default)]
+    liquidity_clob: f64,
 }
 
 impl GammaEventMarket {
@@ -524,6 +547,7 @@ impl GammaEventMarket {
             token_id_yes,
             token_id_no,
             close_ts,
+            liquidity_clob: self.liquidity_clob,
         })
     }
 }
@@ -553,6 +577,7 @@ impl GammaWeatherMarket {
             outcomes:      Some(self.outcomes),
             clob_token_ids: Some(self.clob_token_ids),
             end_date:      Some(self.end_date),
+            liquidity_clob: 0.0,
         }
         .into_weather_market()
     }
@@ -691,6 +716,24 @@ mod tests {
     fn type_extreme_above() {
         let t = parse_market_type("Will Miami be above 38°C this summer?");
         assert_eq!(t, WeatherMarketType::Extreme);
+    }
+
+    #[test]
+    fn type_extreme_or_higher() {
+        let t = parse_market_type("Will the highest temperature in Paris be 23°C or higher on April 18?");
+        assert_eq!(t, WeatherMarketType::Extreme);
+    }
+
+    #[test]
+    fn type_extreme_or_below() {
+        let t = parse_market_type("Will the highest temperature in Paris be 13°C or below on April 16?");
+        assert_eq!(t, WeatherMarketType::Extreme);
+    }
+
+    #[test]
+    fn type_temprange_exact_bucket() {
+        let t = parse_market_type("Will the highest temperature in Paris be 21°C on April 18?");
+        assert_eq!(t, WeatherMarketType::TempRange);
     }
 
     #[test]

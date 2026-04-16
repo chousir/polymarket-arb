@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 import dataclasses
 
-from src.data.storage import CycleResult, DbReader, DryRunTrade, MentionDryRunTrade, WeatherDryRunTrade
+from src.data.storage import CycleResult, DbReader, DryRunTrade, MentionDryRunTrade, WeatherDryRunTrade, WeatherLadderTrade
 from src.backtest.metrics import win_rate
 from src.backtest.mention_report import run_mention_backtest
 from src.backtest.weather_report import run_weather_backtest
@@ -109,6 +109,20 @@ def _load_weather_strategy_ids() -> list[str]:
         s["id"]
         for s in raw.get("strategies", [])
         if s.get("type") == "weather" and s.get("enabled", False) and s.get("id")
+    ]
+
+
+def _load_weather_ladder_strategy_ids() -> list[str]:
+    """Return IDs of all enabled weather_ladder strategies from settings.toml."""
+    path = _settings_path()
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+    return [
+        s["id"]
+        for s in raw.get("strategies", [])
+        if s.get("type") == "weather_ladder" and s.get("enabled", False) and s.get("id")
     ]
 
 
@@ -457,6 +471,12 @@ def _build_daily_winrates(strategy_id: Optional[str] = None) -> list[dict]:
 # ── REST endpoints ────────────────────────────────────────────────────────────
 
 
+@app.get("/health")
+def health_check():
+    """Docker healthcheck endpoint。"""
+    return {"status": "ok"}
+
+
 @app.get("/api/stats")
 def get_stats(strategy_id: Optional[str] = None):
     """今日總覽。可加 ?strategy_id=xxx 篩選單一策略。"""
@@ -684,6 +704,11 @@ def _build_weather_strategy_detail(strategy_id: str, days: int = 30) -> dict:
     avg_hold_sec = sum(hold_secs) / len(hold_secs) if hold_secs else None
 
     active_cities = sorted({t.city for t in entries if t.city})
+
+    # Open positions = entries whose event_id has no corresponding exit record.
+    exited_event_ids = {t.event_id for t in exit_rows}
+    open_entries = [t for t in entries if t.event_id not in exited_event_ids]
+
     # Always surface all ENTRY + EXIT rows (they are few and important).
     # Pad the remaining slots with the most-recent NO_TRADE rows so the log
     # stays readable even when entries/exits are older than recent NO_TRADEs.
@@ -716,6 +741,20 @@ def _build_weather_strategy_detail(strategy_id: str, days: int = 30) -> dict:
         "fs_count": len(fs_rows),
         "td_count": len(td_rows),
         "active_cities": active_cities,
+        "open_positions": [
+            {
+                "id": t.id,
+                "ts": t.ts,
+                "market_slug": t.market_slug,
+                "city": t.city,
+                "side": t.side,
+                "price": t.price,
+                "p_yes_at_entry": t.p_yes_at_entry,
+                "lead_days": t.lead_days,
+                "model": t.model,
+            }
+            for t in sorted(open_entries, key=lambda t: t.ts or "", reverse=True)
+        ],
         "recent_trades": [
             {
                 "id": t.id,
@@ -850,6 +889,182 @@ def get_weather_trades(days: int = 30, strategy_id: Optional[str] = None):
     ]
 
 
+# ── Weather Ladder helpers ────────────────────────────────────────────────────
+
+
+def _build_ladder_strategy_breakdown(days: int = 7) -> list[dict]:
+    """Per-weather_ladder-strategy summary for the dashboard."""
+    r = _reader()
+    rows = r.get_weather_ladder_trades(days=days)
+
+    cap_cfg = _load_strategy_capital_config()
+    by_sid: dict[str, list[WeatherLadderTrade]] = defaultdict(list)
+    for sid in _load_weather_ladder_strategy_ids():
+        by_sid[sid]
+    for row in rows:
+        by_sid[row.strategy_id].append(row)
+
+    result = []
+    for sid, trades in by_sid.items():
+        entries   = [t for t in trades if t.action == "LADDER_ENTRY"]
+        exits     = [t for t in trades if t.action in ("HOLD_TO_RESOLUTION", "CATASTROPHIC_SHIFT_EXIT")]
+        cat_exits = [t for t in trades if t.action == "CATASTROPHIC_SHIFT_EXIT"]
+
+        # Unique ladders
+        entered_ladder_ids = {t.ladder_id for t in entries}
+        exited_ladder_ids  = {t.ladder_id for t in exits}
+        open_ladder_ids    = entered_ladder_ids - exited_ladder_ids
+        total_ladders = len(entered_ladder_ids)
+        open_ladders  = len(open_ladder_ids)
+
+        pnl_series = [t.realized_pnl_usdc for t in exits if t.realized_pnl_usdc is not None]
+        net_pnl    = sum(pnl_series)
+
+        # Avg payout ratio from entries (one entry per leg, all same ratio per ladder)
+        payout_ratios = []
+        by_lid: dict[str, list] = defaultdict(list)
+        for t in entries:
+            by_lid[t.ladder_id].append(t)
+        for legs in by_lid.values():
+            if legs and legs[0].ladder_payout_ratio > 0:
+                payout_ratios.append(legs[0].ladder_payout_ratio)
+        avg_payout = sum(payout_ratios) / len(payout_ratios) if payout_ratios else 0.0
+
+        total_invested = sum(t.size_usdc for t in entries)
+        active_cities  = sorted({t.city for t in entries if t.city})
+        cfg = cap_cfg.get(sid, {})
+        initial_allocated = float(cfg.get("initial_allocated_usdc", 0.0) or 0.0)
+        pnl_pct = net_pnl / initial_allocated if initial_allocated > 0 else 0.0
+
+        result.append({
+            "strategy_id": sid,
+            "total_ladders": total_ladders,
+            "open_ladders": open_ladders,
+            "cat_exit_count": len({t.ladder_id for t in cat_exits}),
+            "total_invested_usdc": total_invested,
+            "avg_payout_ratio": avg_payout,
+            "net_pnl_usdc": net_pnl,
+            "capital_allocation_pct": float(cfg.get("capital_allocation_pct", 0.0) or 0.0),
+            "initial_allocated_usdc": initial_allocated,
+            "pnl_pct_alloc": pnl_pct,
+            "active_cities": active_cities,
+            "total_cities": len(active_cities),
+        })
+
+    return sorted(result, key=lambda x: x["net_pnl_usdc"], reverse=True)
+
+
+def _build_ladder_strategy_detail(strategy_id: str, days: int = 30) -> dict:
+    """Single ladder-strategy drill-down."""
+    r = _reader()
+    trades = r.get_weather_ladder_trades(days=days, strategy_id=strategy_id)
+    cap_cfg = _load_strategy_capital_config().get(strategy_id, {})
+
+    entries   = [t for t in trades if t.action == "LADDER_ENTRY"]
+    htr_rows  = [t for t in trades if t.action == "HOLD_TO_RESOLUTION"]
+    cat_rows  = [t for t in trades if t.action == "CATASTROPHIC_SHIFT_EXIT"]
+    exit_rows = htr_rows + cat_rows
+
+    entered_ladder_ids = {t.ladder_id for t in entries}
+    exited_ladder_ids  = {t.ladder_id for t in exit_rows}
+    open_ladder_ids    = entered_ladder_ids - exited_ladder_ids
+
+    # Build open-ladder groups
+    by_lid: dict[str, list[WeatherLadderTrade]] = defaultdict(list)
+    for t in entries:
+        by_lid[t.ladder_id].append(t)
+
+    open_ladders_list = []
+    for lid in open_ladder_ids:
+        legs = sorted(by_lid.get(lid, []), key=lambda t: t.leg_index)
+        if not legs:
+            continue
+        first = legs[0]
+        open_ladders_list.append({
+            "ladder_id": lid,
+            "city": first.city,
+            "target_date": first.target_date,
+            "legs": len(legs),
+            "sum_price": first.ladder_sum_price,
+            "payout_ratio": first.ladder_payout_ratio,
+            "combined_p": first.ladder_combined_p,
+            "total_usdc": sum(t.size_usdc for t in legs),
+            "model": first.model,
+            "lead_days": first.lead_days,
+            "entry_ts": first.ts,
+        })
+    open_ladders_list.sort(key=lambda x: x["entry_ts"], reverse=True)
+
+    pnl_series = [t.realized_pnl_usdc for t in exit_rows if t.realized_pnl_usdc is not None]
+    net_pnl    = sum(pnl_series)
+    total_invested = sum(t.size_usdc for t in entries)
+
+    payout_ratios = [by_lid[lid][0].ladder_payout_ratio
+                     for lid in entered_ladder_ids if by_lid.get(lid)]
+    avg_payout = sum(payout_ratios) / len(payout_ratios) if payout_ratios else 0.0
+
+    initial_allocated = float(cap_cfg.get("initial_allocated_usdc", 0.0) or 0.0)
+    pnl_pct_alloc     = net_pnl / initial_allocated if initial_allocated > 0 else 0.0
+
+    # Recent trade log: all entry/exit rows, most recent first
+    _key = lambda t: t.ts or ""
+    recent_trades = sorted(trades, key=_key, reverse=True)
+
+    return {
+        "strategy_id": strategy_id,
+        "days": days,
+        "capital_allocation_pct": float(cap_cfg.get("capital_allocation_pct", 0.0) or 0.0),
+        "initial_allocated_usdc": initial_allocated,
+        "total_ladders": len(entered_ladder_ids),
+        "open_ladders": len(open_ladder_ids),
+        "htr_count": len({t.ladder_id for t in htr_rows}),
+        "cat_count": len({t.ladder_id for t in cat_rows}),
+        "avg_payout_ratio": avg_payout,
+        "net_pnl_usdc": net_pnl,
+        "total_invested_usdc": total_invested,
+        "pnl_pct_alloc": pnl_pct_alloc,
+        "open_ladders_list": open_ladders_list,
+        "recent_trades": [
+            {
+                "id": t.id,
+                "ts": t.ts,
+                "ladder_id": t.ladder_id[:8],  # truncated for display
+                "city": t.city,
+                "target_date": t.target_date,
+                "action": t.action,
+                "leg_index": t.leg_index,
+                "price": t.price,
+                "size_usdc": t.size_usdc,
+                "p_yes": t.p_yes,
+                "lead_days": t.lead_days,
+                "ladder_legs": t.ladder_legs,
+                "ladder_sum_price": t.ladder_sum_price,
+                "payout_ratio": t.ladder_payout_ratio,
+                "combined_p": t.ladder_combined_p,
+                "realized_pnl_usdc": t.realized_pnl_usdc,
+                "model": t.model,
+                "reason_code": t.reason_code,
+            }
+            for t in recent_trades
+        ],
+    }
+
+
+# ── Weather Ladder endpoints ──────────────────────────────────────────────────
+
+
+@app.get("/api/ladder/strategies")
+def get_ladder_strategies(days: int = 7):
+    """每個 weather_ladder strategy 的績效拆解。"""
+    return _build_ladder_strategy_breakdown(days=days)
+
+
+@app.get("/api/ladder/strategy-detail")
+def get_ladder_strategy_detail(strategy_id: str, days: int = 30):
+    """單一 weather_ladder 策略詳情。"""
+    return _build_ladder_strategy_detail(strategy_id=strategy_id, days=days)
+
+
 # ── WebSocket: broadcast stats every 5 s ─────────────────────────────────────
 
 
@@ -897,6 +1112,7 @@ async def _broadcast_loop() -> None:
                 "mention_strategies": _build_mention_strategy_breakdown(days=7),
                 "weather": _build_weather_stats(days=7),
                 "weather_strategies": _build_weather_strategy_breakdown(days=7),
+                "ladder_strategies": _build_ladder_strategy_breakdown(days=7),
             })
             await _manager.broadcast(payload)
         except Exception:
@@ -914,6 +1130,7 @@ async def ws_live(ws: WebSocket) -> None:
             "mention_strategies": _build_mention_strategy_breakdown(days=7),
             "weather": _build_weather_stats(days=7),
             "weather_strategies": _build_weather_strategy_breakdown(days=7),
+            "ladder_strategies": _build_ladder_strategy_breakdown(days=7),
         }))
         while True:
             await ws.receive_text()

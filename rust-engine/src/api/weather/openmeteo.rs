@@ -89,7 +89,9 @@ pub async fn fetch_ecmwf(
     city: &CityInfo,
     days: u32,
 ) -> Result<Vec<WeatherForecast>, AppError> {
-    fetch_deterministic(city, days, "ecmwf_ifs04", WeatherModel::Ecmwf).await
+    // ecmwf_ifs04 (0.4°) was deprecated by Open-Meteo and now returns all-null
+    // temperature fields. ecmwf_ifs025 (0.25°) is the current replacement.
+    fetch_deterministic(city, days, "ecmwf_ifs025", WeatherModel::Ecmwf).await
 }
 
 /// Fetch GFS ensemble probabilistic forecast for `city`.
@@ -190,18 +192,28 @@ pub(crate) fn parse_forecast_response(
     let fetched_at = Utc::now();
     let today = fetched_at.date_naive();
 
-    times.iter().enumerate().map(|(i, date_str)| {
+    let mut results = Vec::new();
+    for (i, date_str) in times.iter().enumerate() {
         let forecast_date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .map_err(|e| AppError::ApiError(format!(
                 "[OpenMeteo] bad date '{date_str}': {e}"
             )))?;
 
-        let max_temp_c = max_t.get(i).copied().ok_or_else(|| {
-            AppError::ApiError(format!("[OpenMeteo] missing max_temp at index {i}"))
-        })?;
-        let min_temp_c = min_t.get(i).copied().ok_or_else(|| {
-            AppError::ApiError(format!("[OpenMeteo] missing min_temp at index {i}"))
-        })?;
+        // ECMWF IFS may return null beyond its forecast horizon; skip those days.
+        let max_temp_c = match max_t.get(i).and_then(|v| *v) {
+            Some(v) => v,
+            None => {
+                tracing::debug!("[OpenMeteo] {} date={date_str} max_temp=null, skipping", city.name);
+                continue;
+            }
+        };
+        let min_temp_c = match min_t.get(i).and_then(|v| *v) {
+            Some(v) => v,
+            None => {
+                tracing::debug!("[OpenMeteo] {} date={date_str} min_temp=null, skipping", city.name);
+                continue;
+            }
+        };
 
         // precipitation_probability_max is 0–100 integer; may be absent for some models
         let prob_precip = precip
@@ -212,7 +224,7 @@ pub(crate) fn parse_forecast_response(
 
         let lead_days = (forecast_date - today).num_days().max(0) as u32;
 
-        Ok(WeatherForecast {
+        results.push(WeatherForecast {
             city: city.name.to_string(),
             model,
             forecast_date,
@@ -222,22 +234,25 @@ pub(crate) fn parse_forecast_response(
             ensemble_members: None,
             fetched_at,
             lead_days,
-        })
-    }).collect()
+        });
+    }
+    Ok(results)
 }
 
 // ── Parse ensemble response ───────────────────────────────────────────────────
 //
-// The Open-Meteo ensemble API returns one row per ensemble member per day.
-// The "member" field in `daily` is an array of member-identifiers (same length
-// as `time`), where each consecutive run of `forecast_days` rows belongs to one
-// member.
+// Open-Meteo changed the ensemble API format: each member's data is now a
+// separate column (`temperature_2m_max_member01` … `temperature_2m_max_member30`)
+// rather than repeated rows with a shared `member` identifier.
 //
-// Layout example (2 members, 3 days):
-//   time   = ["2026-06-01","2026-06-02","2026-06-03",
-//              "2026-06-01","2026-06-02","2026-06-03"]
-//   member = ["member01","member01","member01","member02","member02","member02"]
-//   temperature_2m_max = [25.1, 26.3, 27.0, 24.8, 25.9, 26.5]
+// New column-based layout (2 members, 3 days):
+//   time                       = ["2026-06-01", "2026-06-02", "2026-06-03"]
+//   temperature_2m_max         = [25.5, 26.1, 27.0]   ← ensemble control/mean
+//   temperature_2m_max_member01 = [25.1, 26.3, 27.2]
+//   temperature_2m_max_member02 = [25.9, 25.8, 26.8]
+//
+// For each date at index i we collect all memberXX[i] values into
+// ensemble_members so that ensemble_prob_in_range() has 30 readings per day.
 
 pub(crate) fn parse_ensemble_response(
     raw: &EnsembleResponse,
@@ -245,51 +260,84 @@ pub(crate) fn parse_ensemble_response(
     days: u32,
 ) -> Result<Vec<WeatherForecast>, AppError> {
     let times = &raw.daily.time;
-    let max_t  = &raw.daily.temperature_2m_max;
+    let mean_max = &raw.daily.temperature_2m_max;
 
-    if times.is_empty() || max_t.is_empty() {
+    if times.is_empty() || mean_max.is_empty() {
         return Err(AppError::ApiError(format!(
             "[OpenMeteo/Ensemble] empty response for {}", city.name
         )));
     }
 
-    // Group max-temp values by date → collect all member readings for each day
-    let mut by_date: HashMap<String, Vec<f64>> = HashMap::new();
-    let mut min_by_date: HashMap<String, Vec<f64>> = HashMap::new();
+    // Collect all per-member max-temp columns, sorted for consistency.
+    let mut max_member_keys: Vec<&String> = raw.daily.extra.keys()
+        .filter(|k| k.starts_with("temperature_2m_max_member"))
+        .collect();
+    max_member_keys.sort();
 
-    for (i, date_str) in times.iter().enumerate() {
-        if let Some(&max) = max_t.get(i) {
-            by_date.entry(date_str.clone()).or_default().push(max);
-        }
-        if let Some(min_vec) = &raw.daily.temperature_2m_min {
-            if let Some(&min) = min_vec.get(i) {
-                min_by_date.entry(date_str.clone()).or_default().push(min);
-            }
-        }
+    let mut min_member_keys: Vec<&String> = raw.daily.extra.keys()
+        .filter(|k| k.starts_with("temperature_2m_min_member"))
+        .collect();
+    min_member_keys.sort();
+
+    if max_member_keys.is_empty() {
+        return Err(AppError::ApiError(format!(
+            "[OpenMeteo/Ensemble] no member columns in response for {} \
+             (expected temperature_2m_max_member01 … )", city.name
+        )));
     }
+
+    // Parse each member column into a Vec<Option<f64>>.
+    let parse_col = |key: &String| -> Vec<Option<f64>> {
+        raw.daily.extra.get(key)
+            .and_then(|v| serde_json::from_value::<Vec<Option<f64>>>(v.clone()).ok())
+            .unwrap_or_default()
+    };
+
+    let max_cols: Vec<Vec<Option<f64>>> = max_member_keys.iter().map(|k| parse_col(k)).collect();
+    let min_cols: Vec<Vec<Option<f64>>> = min_member_keys.iter().map(|k| parse_col(k)).collect();
 
     let fetched_at = Utc::now();
     let today = fetched_at.date_naive();
 
-    // Build one WeatherForecast per unique date
-    let mut results: Vec<WeatherForecast> = Vec::new();
-    let mut unique_dates: Vec<String> = by_date.keys().cloned().collect();
-    unique_dates.sort();
-    unique_dates.truncate(days as usize);
+    let n = times.len().min(days as usize);
+    let mut results: Vec<WeatherForecast> = Vec::with_capacity(n);
 
-    for date_str in &unique_dates {
+    for i in 0..n {
+        let date_str = &times[i];
         let forecast_date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .map_err(|e| AppError::ApiError(format!(
                 "[OpenMeteo/Ensemble] bad date '{date_str}': {e}"
             )))?;
 
-        let member_maxes = by_date[date_str].clone();
-        let mean_max = member_maxes.iter().sum::<f64>() / member_maxes.len() as f64;
+        // Collect all member readings for this date index.
+        let member_maxes: Vec<f64> = max_cols.iter()
+            .filter_map(|col| col.get(i).and_then(|v| *v))
+            .collect();
 
-        let mean_min = min_by_date
-            .get(date_str)
-            .map(|v| v.iter().sum::<f64>() / v.len() as f64)
-            .unwrap_or(mean_max - 8.0); // rough fallback
+        if member_maxes.is_empty() {
+            tracing::debug!(
+                "[OpenMeteo/Ensemble] {} date={date_str} has no member data, skipping",
+                city.name
+            );
+            continue;
+        }
+
+        let mean_max_val = mean_max.get(i).copied().unwrap_or_else(|| {
+            member_maxes.iter().sum::<f64>() / member_maxes.len() as f64
+        });
+
+        let mean_min = if !min_cols.is_empty() {
+            let min_vals: Vec<f64> = min_cols.iter()
+                .filter_map(|col| col.get(i).and_then(|v| *v))
+                .collect();
+            if min_vals.is_empty() {
+                mean_max_val - 8.0
+            } else {
+                min_vals.iter().sum::<f64>() / min_vals.len() as f64
+            }
+        } else {
+            mean_max_val - 8.0
+        };
 
         let lead_days = (forecast_date - today).num_days().max(0) as u32;
 
@@ -297,9 +345,9 @@ pub(crate) fn parse_ensemble_response(
             city: city.name.to_string(),
             model: WeatherModel::Ensemble,
             forecast_date,
-            max_temp_c: mean_max,
+            max_temp_c: mean_max_val,
             min_temp_c: mean_min,
-            prob_precip: 0.0, // ensemble doesn't provide precip probability
+            prob_precip: 0.0,
             ensemble_members: Some(member_maxes),
             fetched_at,
             lead_days,
@@ -392,8 +440,9 @@ pub(crate) struct ForecastResponse {
 #[derive(Deserialize)]
 pub(crate) struct ForecastDaily {
     pub time: Vec<String>,
-    pub temperature_2m_max: Vec<f64>,
-    pub temperature_2m_min: Vec<f64>,
+    /// Nullable: ECMWF IFS sometimes returns null for days beyond its horizon.
+    pub temperature_2m_max: Vec<Option<f64>>,
+    pub temperature_2m_min: Vec<Option<f64>>,
     /// Some models don't return precipitation probability
     pub precipitation_probability_max: Option<Vec<f64>>,
 }
@@ -418,11 +467,12 @@ pub(crate) struct HourlyData {
 #[derive(Deserialize)]
 pub(crate) struct EnsembleDaily {
     pub time: Vec<String>,
-    /// May be absent in some Open-Meteo ensemble responses; tolerated gracefully.
-    #[serde(default)]
-    pub member: Vec<String>,
+    /// Ensemble control / mean for the day (used as fallback mean_max).
     pub temperature_2m_max: Vec<f64>,
     pub temperature_2m_min: Option<Vec<f64>>,
+    /// Per-member columns: `temperature_2m_max_member01` … captured dynamically.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -445,8 +495,8 @@ mod tests {
         ForecastResponse {
             daily: ForecastDaily {
                 time: dates.iter().map(|s| s.to_string()).collect(),
-                temperature_2m_max: max_t.to_vec(),
-                temperature_2m_min: min_t.to_vec(),
+                temperature_2m_max: max_t.iter().map(|&v| Some(v)).collect(),
+                temperature_2m_min: min_t.iter().map(|&v| Some(v)).collect(),
                 precipitation_probability_max: precip.map(|v| v.to_vec()),
             },
         }
@@ -489,22 +539,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_ensemble_response_groups_by_date() {
-        // 3 members × 2 days
+    fn parses_ensemble_response_column_format() {
+        // New column-based format: 3 members × 2 days
+        // temperature_2m_max_memberXX each have one value per date.
+        let make_col = |vals: &[f64]| -> serde_json::Value {
+            serde_json::to_value(vals.iter().map(|&v| Some(v)).collect::<Vec<_>>()).unwrap()
+        };
         let raw = EnsembleResponse {
             daily: EnsembleDaily {
-                time: vec![
-                    "2026-06-15".into(), "2026-06-16".into(),
-                    "2026-06-15".into(), "2026-06-16".into(),
-                    "2026-06-15".into(), "2026-06-16".into(),
-                ],
-                member: vec![
-                    "member01".into(), "member01".into(),
-                    "member02".into(), "member02".into(),
-                    "member03".into(), "member03".into(),
-                ],
-                temperature_2m_max: vec![25.0, 26.0, 27.0, 28.0, 23.0, 24.0],
+                time: vec!["2026-06-15".into(), "2026-06-16".into()],
+                temperature_2m_max: vec![25.0, 26.0], // ensemble control
                 temperature_2m_min: None,
+                extra: [
+                    ("temperature_2m_max_member01".to_string(), make_col(&[25.0, 26.0])),
+                    ("temperature_2m_max_member02".to_string(), make_col(&[27.0, 28.0])),
+                    ("temperature_2m_max_member03".to_string(), make_col(&[23.0, 24.0])),
+                ].into_iter().collect(),
             },
         };
         let forecasts = parse_ensemble_response(&raw, nyc(), 2).unwrap();
@@ -512,13 +562,25 @@ mod tests {
 
         let f0 = forecasts.iter().find(|f| f.forecast_date.day() == 15).unwrap();
         assert_eq!(f0.member_count(), 3);
-        // mean of 25, 27, 23 = 25.0
+        // control mean = 25.0
         assert!((f0.max_temp_c - 25.0).abs() < 1e-6);
 
-        // 2 out of 3 members (27, 25) are in [24, 27] — let's verify
-        let p = f0.ensemble_prob_in_range(24.0, 27.0).unwrap();
         // members: 25, 27, 23 → 25 ✓, 27 ✓, 23 ✗ → 2/3
+        let p = f0.ensemble_prob_in_range(24.0, 27.0).unwrap();
         assert!((p - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ensemble_no_member_columns_returns_error() {
+        let raw = EnsembleResponse {
+            daily: EnsembleDaily {
+                time: vec!["2026-06-15".into()],
+                temperature_2m_max: vec![25.0],
+                temperature_2m_min: None,
+                extra: HashMap::new(), // no memberXX columns
+            },
+        };
+        assert!(parse_ensemble_response(&raw, nyc(), 1).is_err());
     }
 
     #[test]

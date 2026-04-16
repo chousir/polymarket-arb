@@ -123,12 +123,17 @@ GET https://aviationweather.gov/api/data/metar
 - **優勢**：NWS 預測含官方概率值，不需推導
 - **劣勢**：僅美國城市；NWS API 偶爾不穩定
 
+NWS 策略的運行方式是：系統每約 15 分鐘掃描一次天氣市場，先過濾可交易標的（美國 12 座城市白名單、到期天數 1–7 天、最小深度 75 USDC 與最大價差 0.05），再用 NWS 預報把事件換成模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.65 或 ≤0.35）且淨邊際超過門檻（如 800 bps）才進場買 YES 或 NO，進場後會持續監控四種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2taker_fee_bps + 2slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.06）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT），以及新一輪 NWS 預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.15），用來控制回撤並鎖定有效邊際。
+
 ### Strategy 2：`weather_gfs_global`
 - **資料源**：Open-Meteo GFS 模型
 - **目標城市**：所有 10 個城市
 - **方法**：GFS 點預測 → 結合歷史誤差建立概率分布
 - **優勢**：全球覆蓋；每 6 小時更新
 - **劣勢**：需要自建概率轉換邏輯（點預測 → 概率）
+
+GFS 策略的運行方式是：系統每約 15 分鐘掃描一次天氣市場，先過濾可交易標的（城市白名單、到期天數 1–7 天、最小深度 75 USDC 與最大價差 0.06），再用 GFS 預報把事件換成模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.65 或 ≤0.35）且淨邊際超過門檻（如 1000 bps）才進場買 YES 或 NO，進場後會持續監控四種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2*taker_fee_bps + 2*slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.06）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT），以及新一輪 GFS 預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.15），用來控制回撤並鎖定有效邊際。
+
 
 ### Strategy 3：`weather_ecmwf_global`
 - **資料源**：Open-Meteo ECMWF IFS 模型
@@ -137,12 +142,16 @@ GET https://aviationweather.gov/api/data/metar
 - **優勢**：準確率最高（中期 3–10 日預測）
 - **劣勢**：解析度較低（0.4°）；概率需推導
 
+ECMWF 策略的運行方式是：系統每約 15 分鐘掃描一次天氣市場，先過濾可交易標的（全球 13 座城市白名單、到期天數 2–5 天、最小深度 50 USDC 與最大價差 0.07），再用 ECMWF 預報把事件換成模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.62 或 ≤0.38）且淨邊際超過門檻（如 800 bps）才進場買 YES 或 NO，進場後會持續監控四種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2taker_fee_bps + 2slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.07）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT），以及新一輪 ECMWF 預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.12），用來控制回撤並鎖定有效邊際。
+
 ### Strategy 4：`weather_ensemble_prob`
 - **資料源**：Open-Meteo Ensemble API（50 個集成成員）
 - **目標城市**：NYC、倫敦、東京（高流動性優先）
 - **方法**：直接統計集成成員落在目標溫度範圍的比例 → 直接輸出概率
 - **優勢**：最直接的概率計算，不需推導
 - **劣勢**：API 呼叫較重；每 6 小時更新
+
+Ensemble 策略的運行方式是：系統每約 15 分鐘掃描一次天氣市場，先過濾可交易標的（全球 10 座高流動性城市白名單、到期天數 1–7 天、最小深度 50 USDC 與最大價差 0.06），再用 Ensemble 預報（統計 50+ 個集成成員分布）把事件換成模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.70 或 ≤0.30）且淨邊際超過門檻（如 1000 bps）才進場買 YES 或 NO，進場後會持續監控四種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2taker_fee_bps + 2slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.12）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT），以及新一輪 Ensemble 預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.12），用來控制回撤並鎖定有效邊際。
 
 ### Strategy 5：`weather_multi_consensus`
 - **資料源**：GFS + ECMWF + Ensemble 三者交叉比對
@@ -151,12 +160,16 @@ GET https://aviationweather.gov/api/data/metar
 - **優勢**：最高信心度；假陽性最少
 - **劣勢**：進場頻率最低
 
+Consensus（多模型共識）策略的運行方式是：系統每約 15 分鐘掃描一次天氣市場，先過濾可交易標的（NYC 與倫敦等最高流動性城市白名單、到期天數 1–7 天、最小深度 50 USDC 與最大價差 0.06），再交叉比對 GFS、ECMWF 與 Ensemble 三大模型預報，僅當三者機率分歧小於 10%（共識極高）時，才把事件換成共識模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.60 或 ≤0.40）且淨邊際超過門檻（如 600 bps，因具備多模型共識，故允許較低進場門檻）才進場買 YES 或 NO，進場後會持續監控五種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2taker_fee_bps + 2slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.15）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT）、新一輪預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.15），**以及當模型間的預測分歧擴大破壞共識時（MODEL_DIVERGENCE）**提前減倉或平倉，用來控制回撤並鎖定有效邊際。
+
 ### Strategy 6：`weather_metar_short`
 - **資料源**：METAR 即時觀測 + NWS/GFS 短期預測
 - **目標城市**：所有有 ICAO 代碼的城市
 - **方法**：結合當前實測溫度趨勢，只做 24 小時內到期的市場
 - **優勢**：短期預測準確率最高（>85%）
 - **劣勢**：市場到期太快，流動性可能不足
+
+METAR 短線策略的運行方式是：系統每約 5 分鐘（loop_interval_sec=300，因短線天氣變化極快，掃描頻率高於其他策略的 15 分鐘）掃描一次天氣市場，先過濾可交易標的（全球所有支援且具備 ICAO 代碼的城市、到期天數 0–1 天的極短線、最小深度 60 USDC 與最大價差 0.07），再用 METAR 即時地面觀測結合 NWS/GFS 短期預測把事件換成模型機率 Pyes​，並和盤口價格比較計算淨邊際（已扣 (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2 緩衝）；只有當模型信心夠高（例如 Pyes≥0.62 或 ≤0.38）且淨邊際超過門檻（如 700 bps）才進場買 YES 或 NO，進場後會持續監控四種出場條件：到達止盈價就獲利了結（TAKE_PROFIT：entry_price + ((2taker_fee_bps + 2slippage_buffer_bps + 0.5*min_net_edge_bps)/10000)）、價格反向跌破止損帶就停損（STOP_LOSS=0.10）、距離收盤太近就時間止盈/止損退出（TIME_DECAY_EXIT），以及新一輪觀測預測使機率偏移超過閾值時提前平倉（FORECAST_SHIFT=0.10），用來控制回撤並鎖定有效邊際。
 
 ---
 

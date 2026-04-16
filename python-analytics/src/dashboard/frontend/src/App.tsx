@@ -149,6 +149,61 @@ interface MentionStrategyDetail {
 }
 
 
+// ── Weather Ladder types ──────────────────────────────────────────────────────
+
+interface WeatherLadderStrategySummary {
+  strategy_id: string
+  total_ladders: number
+  open_ladders: number
+  cat_exit_count: number
+  total_invested_usdc: number
+  avg_payout_ratio: number
+  net_pnl_usdc: number
+  capital_allocation_pct: number
+  initial_allocated_usdc: number
+  pnl_pct_alloc: number
+  active_cities: string[]
+  total_cities: number
+}
+
+interface OpenLadder {
+  ladder_id: string
+  city: string
+  target_date: string
+  legs: number
+  sum_price: number
+  payout_ratio: number
+  combined_p: number
+  total_usdc: number
+  model: string
+  lead_days: number | null
+  entry_ts: string
+}
+
+interface WeatherLadderStrategyDetail {
+  strategy_id: string
+  days: number
+  capital_allocation_pct: number
+  initial_allocated_usdc: number
+  total_ladders: number
+  open_ladders: number
+  htr_count: number
+  cat_count: number
+  avg_payout_ratio: number
+  net_pnl_usdc: number
+  total_invested_usdc: number
+  pnl_pct_alloc: number
+  open_ladders_list: OpenLadder[]
+  recent_trades: {
+    id: number; ts: string; ladder_id: string; city: string
+    target_date: string; action: string; leg_index: number
+    price: number; size_usdc: number; p_yes: number | null
+    lead_days: number | null; ladder_legs: number
+    ladder_sum_price: number; payout_ratio: number; combined_p: number
+    realized_pnl_usdc: number | null; model: string; reason_code: string
+  }[]
+}
+
 // ── Weather types ─────────────────────────────────────────────────────────────
 
 interface WeatherStats {
@@ -222,6 +277,11 @@ interface WeatherStrategyDetail {
   fs_count: number
   td_count: number
   active_cities: string[]
+  open_positions: {
+    id: number; ts: string; market_slug: string; city: string
+    side: string; price: number; p_yes_at_entry: number | null
+    lead_days: number | null; model: string
+  }[]
   recent_trades: {
     id: number; ts: string; market_slug: string; city: string; market_type: string
     side: string; action: string; price: number; size_usdc: number; hold_sec: number | null
@@ -252,6 +312,27 @@ function StatCard({ label, value, sub }: { label: string; value: string; sub?: s
       {sub && <div className="stat-sub">{sub}</div>}
     </div>
   )
+}
+
+/// Parse a market slug like "highest-temperature-in-toronto-on-april-15-2026-18corbelow"
+/// into a readable string: "≤18°C · Apr 15" or "≥25°C · Apr 15"
+function parseMarketDesc(slug: string): string {
+  if (!slug) return '—'
+  const tempMatch = slug.match(/(\d+)(c|f)or?(above|below)/i)
+  if (!tempMatch) return slug.replace(/^highest-temperature-in-/, '').replace(/-/g, ' ')
+  const [, rawTemp, unit, dir] = tempMatch
+  const tempNum = parseInt(rawTemp)
+  const tempStr = unit.toLowerCase() === 'c' ? `${tempNum}°C` : `${tempNum}°F`
+  const sign = dir.toLowerCase() === 'below' ? '≤' : '≥'
+  const dateMatch = slug.match(/on-(\w+)-(\d+)-(\d{4})/i)
+  if (!dateMatch) return `${sign}${tempStr}`
+  const [, month, day] = dateMatch
+  const months: Record<string, string> = {
+    january:'Jan', february:'Feb', march:'Mar', april:'Apr',
+    may:'May', june:'Jun', july:'Jul', august:'Aug',
+    september:'Sep', october:'Oct', november:'Nov', december:'Dec',
+  }
+  return `${sign}${tempStr} · ${months[month.toLowerCase()] ?? month} ${day}`
 }
 
 function ActionBadge({ action }: { action: string }) {
@@ -286,6 +367,77 @@ function ReasonBadge({ code }: { code: string }) {
     STOP_LOSS: '#f87171',
   }
   return <span style={{ color: colors[code] ?? '#94a3b8', fontSize: 11 }}>{code}</span>
+}
+
+function LadderActionBadge({ action }: { action: string }) {
+  const styles: Record<string, [string, string]> = {
+    LADDER_ENTRY:           ['#0c1a30', '#60a5fa'],
+    HOLD_TO_RESOLUTION:     ['#052e16', '#34d399'],
+    CATASTROPHIC_SHIFT_EXIT:['#2d0a0a', '#f87171'],
+  }
+  const [bg, fg] = styles[action] ?? ['#1e293b', '#cbd5e1']
+  const label = action === 'HOLD_TO_RESOLUTION' ? 'HOLD_RES'
+              : action === 'CATASTROPHIC_SHIFT_EXIT' ? 'CAT_EXIT'
+              : action === 'LADDER_ENTRY' ? 'ENTRY'
+              : action
+  return (
+    <span style={{
+      display: 'inline-block', padding: '2px 7px', borderRadius: 4,
+      fontSize: 10, fontWeight: 700, letterSpacing: '0.02em',
+      background: bg, color: fg, border: `1px solid ${fg}33`,
+    }}>{label}</span>
+  )
+}
+
+function Paginator({
+  total, page, pageSize, onPage, onPageSize,
+  pageSizeOptions = [10, 25, 50],
+}: {
+  total: number; page: number; pageSize: number
+  onPage: (p: number) => void; onPageSize: (n: number) => void
+  pageSizeOptions?: number[]
+}) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const btnStyle = (disabled: boolean): React.CSSProperties => ({
+    background: disabled ? 'transparent' : '#1e1e42',
+    border: '1px solid #2e3348', borderRadius: 4,
+    color: disabled ? '#3a3a58' : '#a5b4fc',
+    cursor: disabled ? 'default' : 'pointer',
+    fontSize: 11, padding: '2px 8px', lineHeight: '18px',
+  })
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '6px 0 2px', fontSize: 11, color: '#8892a4',
+    }}
+      onClick={e => e.stopPropagation()}
+    >
+      <button style={btnStyle(page === 0)} disabled={page === 0}
+        onClick={() => onPage(0)}>«</button>
+      <button style={btnStyle(page === 0)} disabled={page === 0}
+        onClick={() => onPage(page - 1)}>‹</button>
+      <span style={{ minWidth: 60, textAlign: 'center', color: '#cbd5e1' }}>
+        {page + 1} / {totalPages}
+      </span>
+      <button style={btnStyle(page >= totalPages - 1)} disabled={page >= totalPages - 1}
+        onClick={() => onPage(page + 1)}>›</button>
+      <button style={btnStyle(page >= totalPages - 1)} disabled={page >= totalPages - 1}
+        onClick={() => onPage(totalPages - 1)}>»</button>
+      <select
+        value={pageSize}
+        onChange={e => { onPageSize(Number(e.target.value)); onPage(0) }}
+        style={{
+          background: '#0e0e1a', border: '1px solid #2e3348', borderRadius: 4,
+          color: '#8892a4', fontSize: 11, padding: '2px 4px', marginLeft: 6,
+        }}
+      >
+        {pageSizeOptions.map(n => (
+          <option key={n} value={n}>{n} 筆/頁</option>
+        ))}
+      </select>
+      <span style={{ color: '#4b5563', marginLeft: 2 }}>共 {total} 筆</span>
+    </div>
+  )
 }
 
 // ── BTC 15m tab ───────────────────────────────────────────────────────────────
@@ -787,11 +939,16 @@ function MentionTab() {
 function WeatherTab() {
   const [weatherStats, setWeatherStats] = useState<WeatherStats | null>(null)
   const [strategies, setStrategies] = useState<WeatherStrategySummary[]>([])
+  const [ladderStrategies, setLadderStrategies] = useState<WeatherLadderStrategySummary[]>([])
   const [tick, setTick] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [ladderExpandedId, setLadderExpandedId] = useState<string | null>(null)
   const [detailCache, setDetailCache] = useState<Record<string, WeatherStrategyDetail>>({})
+  const [ladderDetailCache, setLadderDetailCache] = useState<Record<string, WeatherLadderStrategyDetail>>({})
   const [tradeFilters, setTradeFilters] = useState<Record<string, string>>({})
-  const [showMoreMap, setShowMoreMap] = useState<Record<string, boolean>>({})
+  const [ladderFilterMap, setLadderFilterMap] = useState<Record<string, string>>({})
+  const [pageMap, setPageMap] = useState<Record<string, number>>({})
+  const [pageSizeMap, setPageSizeMap] = useState<Record<string, number>>({})
 
   useEffect(() => {
     const timer = setInterval(() => setTick(t => t + 1), 5000)
@@ -801,6 +958,7 @@ function WeatherTab() {
   useEffect(() => {
     fetchJson<WeatherStats>('/api/weather/stats?days=7').then(setWeatherStats)
     fetchJson<WeatherStrategySummary[]>('/api/weather/strategies?days=7').then(setStrategies)
+    fetchJson<WeatherLadderStrategySummary[]>('/api/ladder/strategies?days=7').then(setLadderStrategies)
   }, [tick])
 
   useEffect(() => {
@@ -809,6 +967,13 @@ function WeatherTab() {
       `/api/weather/strategy-detail?strategy_id=${encodeURIComponent(expandedId)}&days=30`
     ).then(d => setDetailCache(prev => ({ ...prev, [expandedId]: d })))
   }, [expandedId, tick])
+
+  useEffect(() => {
+    if (!ladderExpandedId) return
+    fetchJson<WeatherLadderStrategyDetail>(
+      `/api/ladder/strategy-detail?strategy_id=${encodeURIComponent(ladderExpandedId)}&days=30`
+    ).then(d => setLadderDetailCache(prev => ({ ...prev, [ladderExpandedId]: d })))
+  }, [ladderExpandedId, tick])
 
   const toggleExpand = (id: string) =>
     setExpandedId(prev => prev === id ? null : id)
@@ -878,6 +1043,9 @@ function WeatherTab() {
 
                     // Trade grouping — computed once, referenced in expanded row
                     const allTrades     = cached?.recent_trades ?? []
+                    // open_positions = truly open (no exit yet); used for OPEN box + city dots
+                    const openPositions = cached?.open_positions ?? []
+                    // entryTrades = all ENTRY records in the trade log (open + closed history)
                     const entryTrades   = allTrades.filter(t => t.action === 'ENTRY')
                     const exitTrades    = allTrades.filter(t =>
                       ['TAKE_PROFIT','STOP_LOSS','FORECAST_SHIFT','TIME_DECAY_EXIT'].includes(t.action))
@@ -889,9 +1057,9 @@ function WeatherTab() {
                       activeFilter === 'exit'     ? exitTrades :
                       activeFilter === 'no_trade' ? noTradeTrades :
                       allTrades
-                    const PAGE_SIZE     = 5
-                    const isShowingMore = !!showMoreMap[s.strategy_id]
-                    const shownTrades   = isShowingMore ? filteredTrades : filteredTrades.slice(0, PAGE_SIZE)
+                    const page     = pageMap[s.strategy_id] ?? 0
+                    const pageSize = pageSizeMap[s.strategy_id] ?? 10
+                    const shownTrades = filteredTrades.slice(page * pageSize, (page + 1) * pageSize)
 
                     return (
                       <Fragment key={s.strategy_id}>
@@ -907,7 +1075,7 @@ function WeatherTab() {
                             </span>
                             {s.strategy_id}
                             {/* Live-position badge visible even when collapsed */}
-                            {entryTrades.length > 0 && (
+                            {openPositions.length > 0 && (
                               <span style={{
                                 marginLeft: 8,
                                 display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -921,7 +1089,7 @@ function WeatherTab() {
                                   background: '#34d399', boxShadow: '0 0 4px #34d399',
                                   display: 'inline-block',
                                 }} />
-                                {entryTrades.length}
+                                {openPositions.length}
                               </span>
                             )}
                           </td>
@@ -939,42 +1107,64 @@ function WeatherTab() {
                             <td colSpan={7} style={{ padding: 0, background: '#080812', borderBottom: '1px solid #1a1a2e' }}>
                               <div style={{ padding: '14px 18px 16px' }}>
 
-                                {/* ── Active entries banner ── */}
-                                {entryTrades.length > 0 && (
+                                {/* ── Active entries list ── */}
+                                {openPositions.length > 0 && (
                                   <div style={{
-                                    display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8,
-                                    background: 'rgba(52,211,153,0.06)',
-                                    border: '1px solid rgba(52,211,153,0.2)',
-                                    borderRadius: 6, padding: '8px 12px', marginBottom: 12,
+                                    background: 'rgba(52,211,153,0.04)',
+                                    border: '1px solid rgba(52,211,153,0.22)',
+                                    borderRadius: 6, marginBottom: 12, overflow: 'hidden',
                                   }}>
-                                    <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                                      <span style={{
-                                        width: 7, height: 7, borderRadius: '50%',
-                                        background: '#34d399', boxShadow: '0 0 5px #34d399',
-                                        display: 'inline-block',
-                                      }} />
+                                    {/* header */}
+                                    <div style={{
+                                      display: 'flex', alignItems: 'center', gap: 8,
+                                      padding: '6px 12px',
+                                      borderBottom: '1px solid rgba(52,211,153,0.15)',
+                                      background: 'rgba(52,211,153,0.06)',
+                                    }}>
+                                      <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                                        background: '#34d399', boxShadow: '0 0 5px #34d399', display: 'inline-block' }} />
                                       <span style={{ fontSize: 11, fontWeight: 700, color: '#34d399', letterSpacing: '0.06em' }}>
-                                        ACTIVE {entryTrades.length}
+                                        OPEN {openPositions.length}
                                       </span>
-                                    </span>
-                                    {entryTrades.map(t => (
-                                      <span key={t.id} style={{
-                                        display: 'inline-flex', alignItems: 'center', gap: 5,
-                                        background: '#091c12', border: '1px solid #145228',
-                                        borderRadius: 5, padding: '3px 9px', fontSize: 11,
-                                      }}>
-                                        <span style={{ fontFamily: 'monospace', color: '#6ee7b7', fontWeight: 600 }}>{t.city}</span>
-                                        <span style={{ color: t.side === 'NO' ? '#fb923c' : '#6ee7b7', fontWeight: 600 }}>{t.side}</span>
-                                        <span style={{ color: '#94a3b8' }}>@{t.price.toFixed(4)}</span>
-                                        {t.p_yes_at_entry != null && (
-                                          <span style={{ color: '#64748b' }}>p={t.p_yes_at_entry.toFixed(3)}</span>
-                                        )}
-                                        {t.lead_days != null && (
-                                          <span style={{ color: '#8892a4' }}>{t.lead_days}d</span>
-                                        )}
-                                        <span style={{ color: '#64748b', fontSize: 10 }}>{t.ts?.slice(11, 19)}</span>
-                                      </span>
-                                    ))}
+                                      <span style={{ fontSize: 10, color: '#64748b', marginLeft: 4 }}>— 目前持倉</span>
+                                    </div>
+                                    {/* rows */}
+                                    <div style={{ display: 'grid',
+                                      gridTemplateColumns: 'min-content min-content 5.5rem 1fr min-content min-content min-content',
+                                      alignItems: 'center', gap: '0 14px',
+                                      padding: '0 12px',
+                                    }}>
+                                      {/* col headers */}
+                                      {['CITY','SIDE','@PRICE','MARKET','P_YES','LEAD','TIME'].map(h => (
+                                        <span key={h} style={{ fontSize: 9, color: '#4b5563', fontWeight: 700,
+                                          letterSpacing: '0.08em', padding: '5px 0 3px' }}>{h}</span>
+                                      ))}
+                                      {openPositions.map(t => (
+                                        <Fragment key={t.id}>
+                                          <span style={{ fontFamily: 'monospace', fontSize: 11, fontWeight: 600,
+                                            color: '#6ee7b7', paddingBottom: 5 }}>{t.city}</span>
+                                          <span style={{ fontSize: 11, fontWeight: 700, paddingBottom: 5,
+                                            color: t.side === 'NO' ? '#fb923c' : '#34d399' }}>{t.side}</span>
+                                          <span style={{ fontSize: 11, fontWeight: 600, color: '#e2e8f0', paddingBottom: 5 }}>
+                                            {t.price.toFixed(4)}
+                                          </span>
+                                          <span style={{ fontSize: 10, color: '#a5b4fc', paddingBottom: 5,
+                                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                            fontFamily: 'monospace' }}>
+                                            {parseMarketDesc(t.market_slug ?? '')}
+                                          </span>
+                                          <span style={{ fontSize: 11, color: '#94a3b8', paddingBottom: 5 }}>
+                                            {t.p_yes_at_entry != null ? t.p_yes_at_entry.toFixed(3) : '—'}
+                                          </span>
+                                          <span style={{ fontSize: 11, color: '#8892a4', paddingBottom: 5 }}>
+                                            {t.lead_days != null ? `${t.lead_days}d` : '—'}
+                                          </span>
+                                          <span style={{ fontSize: 10, color: '#64748b', fontFamily: 'monospace', paddingBottom: 5 }}>
+                                            {t.ts?.slice(11, 19)}
+                                          </span>
+                                        </Fragment>
+                                      ))}
+                                    </div>
                                   </div>
                                 )}
 
@@ -990,7 +1180,7 @@ function WeatherTab() {
                                     {s.active_cities.length === 0
                                       ? <span style={{ fontSize: 11, color: '#64748b' }}>—</span>
                                       : s.active_cities.map(c => {
-                                          const live = entryTrades.some(e => e.city === c)
+                                          const live = openPositions.some(e => e.city === c)
                                           return (
                                             <span key={c} style={{
                                               display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -1091,7 +1281,7 @@ function WeatherTab() {
                                           <table>
                                             <thead><tr>
                                               <th>Time</th><th>City</th><th>Side</th>
-                                              <th>Action</th><th>Model</th><th>p_yes</th>
+                                              <th>Action</th><th>Market</th><th>Model</th><th>p_yes</th>
                                               <th>Lead</th><th>Hold</th><th>PnL</th>
                                             </tr></thead>
                                             <tbody>
@@ -1119,6 +1309,9 @@ function WeatherTab() {
                                                       )}
                                                     </td>
                                                     <td><ActionBadge action={t.action} /></td>
+                                                    <td style={{ fontSize: 10, color: '#a5b4fc', fontFamily: 'monospace', whiteSpace: 'nowrap' }}>
+                                                      {parseMarketDesc(t.market_slug ?? '')}
+                                                    </td>
                                                     <td style={{ fontSize: 10, color: '#94a3b8' }}>{t.model}</td>
                                                     <td>{t.p_yes_at_entry != null ? t.p_yes_at_entry.toFixed(3) : '—'}</td>
                                                     <td>{t.lead_days != null ? `${t.lead_days}d` : '—'}</td>
@@ -1134,21 +1327,17 @@ function WeatherTab() {
                                           </table>
                                         </div>
 
-                                        {filteredTrades.length > PAGE_SIZE && (
-                                          <button
-                                            onClick={e => {
-                                              e.stopPropagation()
-                                              setShowMoreMap(prev => ({ ...prev, [s.strategy_id]: !prev[s.strategy_id] }))
+                                        {filteredTrades.length > pageSize && (
+                                          <Paginator
+                                            total={filteredTrades.length}
+                                            page={page}
+                                            pageSize={pageSize}
+                                            onPage={p => setPageMap(prev => ({ ...prev, [s.strategy_id]: p }))}
+                                            onPageSize={n => {
+                                              setPageSizeMap(prev => ({ ...prev, [s.strategy_id]: n }))
+                                              setPageMap(prev => ({ ...prev, [s.strategy_id]: 0 }))
                                             }}
-                                            style={{
-                                              background: 'transparent', border: 'none',
-                                              color: '#8892a4', fontSize: 11, cursor: 'pointer',
-                                              padding: '6px 0 0', width: '100%', textAlign: 'center',
-                                              display: 'block',
-                                            }}
-                                          >
-                                            {isShowingMore ? '▲ 收起' : `▼ 再顯示 ${filteredTrades.length - PAGE_SIZE} 筆`}
-                                          </button>
+                                          />
                                         )}
                                       </>
                                     )}
@@ -1209,6 +1398,224 @@ function WeatherTab() {
           </div>
         </section>
       )}
+
+      {/* ── Weather Ladder section ─────────────────────────────────────── */}
+      <section className="panel" style={{ marginTop: 8 }}>
+        <h2 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          Weather Ladder
+          <span style={{
+            fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+            background: 'rgba(96,165,250,0.12)', border: '1px solid rgba(96,165,250,0.30)',
+            borderRadius: 8, padding: '2px 8px', color: '#60a5fa',
+          }}>Phase 5b — 高賠率梯形</span>
+        </h2>
+        {ladderStrategies.length === 0
+          ? <p className="empty">No weather_ladder strategy data yet.</p>
+          : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr>
+                  <th>Strategy</th><th>Ladders</th><th>Open</th>
+                  <th>Avg Payout</th><th>Invested</th><th>Net PnL</th>
+                  <th>PnL % (alloc)</th><th>Cities</th>
+                </tr></thead>
+                <tbody>
+                  {ladderStrategies.map(s => {
+                    const isExpanded = ladderExpandedId === s.strategy_id
+                    const cached = ladderDetailCache[s.strategy_id]
+                    type LF = 'all' | 'entry' | 'exit'
+                    const allTrades   = cached?.recent_trades ?? []
+                    const entryTrades = allTrades.filter(t => t.action === 'LADDER_ENTRY')
+                    const exitTrades  = allTrades.filter(t => t.action !== 'LADDER_ENTRY')
+                    const activeFilter = (ladderFilterMap[s.strategy_id] ?? 'all') as LF
+                    const filteredTrades =
+                      activeFilter === 'entry' ? entryTrades :
+                      activeFilter === 'exit'  ? exitTrades  : allTrades
+                    const page     = pageMap[`l_${s.strategy_id}`] ?? 0
+                    const pageSize = pageSizeMap[`l_${s.strategy_id}`] ?? 10
+                    const shownTrades = filteredTrades.slice(page * pageSize, (page + 1) * pageSize)
+
+                    return (
+                      <Fragment key={s.strategy_id}>
+                        <tr onClick={() => setLadderExpandedId(prev => prev === s.strategy_id ? null : s.strategy_id)}
+                          style={{ cursor: 'pointer' }}
+                          className={isExpanded ? 'row-selected' : ''}>
+                          <td className="slug">
+                            <span style={{ marginRight: 6, opacity: 0.5, fontSize: 10, userSelect: 'none' }}>
+                              {isExpanded ? '▼' : '▶'}
+                            </span>
+                            {s.strategy_id}
+                            {s.open_ladders > 0 && (
+                              <span style={{
+                                marginLeft: 8, display: 'inline-flex', alignItems: 'center', gap: 4,
+                                background: 'rgba(96,165,250,0.12)',
+                                border: '1px solid rgba(96,165,250,0.35)',
+                                borderRadius: 10, padding: '1px 7px',
+                                fontSize: 9, fontWeight: 700, color: '#60a5fa',
+                              }}>
+                                <span style={{ width: 5, height: 5, borderRadius: '50%',
+                                  background: '#60a5fa', boxShadow: '0 0 4px #60a5fa', display: 'inline-block' }} />
+                                {s.open_ladders}
+                              </span>
+                            )}
+                          </td>
+                          <td>{s.total_ladders}</td>
+                          <td style={{ color: s.open_ladders > 0 ? '#60a5fa' : '#64748b' }}>{s.open_ladders}</td>
+                          <td style={{ color: '#fbbf24' }}>{s.avg_payout_ratio > 0 ? `${s.avg_payout_ratio.toFixed(0)}x` : '—'}</td>
+                          <td>{s.total_invested_usdc.toFixed(2)}</td>
+                          <td className={s.net_pnl_usdc >= 0 ? 'green' : 'red'}>{usd(s.net_pnl_usdc)}</td>
+                          <td className={s.pnl_pct_alloc >= 0 ? 'green' : 'red'}>{signedPct(s.pnl_pct_alloc)}</td>
+                          <td>{s.total_cities}</td>
+                        </tr>
+
+                        {isExpanded && (
+                          <tr>
+                            <td colSpan={8} style={{ padding: 0, background: '#080812', borderBottom: '1px solid #1a1a2e' }}>
+                              <div style={{ padding: '14px 18px 16px' }}>
+
+                                {/* Open ladders */}
+                                {(cached?.open_ladders_list ?? []).length > 0 && (
+                                  <div style={{
+                                    background: 'rgba(96,165,250,0.04)',
+                                    border: '1px solid rgba(96,165,250,0.22)',
+                                    borderRadius: 6, marginBottom: 12, overflow: 'hidden',
+                                  }}>
+                                    <div style={{
+                                      display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px',
+                                      borderBottom: '1px solid rgba(96,165,250,0.15)',
+                                      background: 'rgba(96,165,250,0.06)',
+                                    }}>
+                                      <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                                        background: '#60a5fa', boxShadow: '0 0 5px #60a5fa', display: 'inline-block' }} />
+                                      <span style={{ fontSize: 11, fontWeight: 700, color: '#60a5fa', letterSpacing: '0.06em' }}>
+                                        OPEN {cached!.open_ladders_list.length}
+                                      </span>
+                                      <span style={{ fontSize: 10, color: '#64748b', marginLeft: 4 }}>— 未到期梯形</span>
+                                    </div>
+                                    <div style={{ display: 'grid',
+                                      gridTemplateColumns: 'repeat(8, min-content)',
+                                      alignItems: 'center', gap: '0 14px', padding: '0 12px',
+                                    }}>
+                                      {['CITY','DATE','LEGS','SUM','PAYOUT','COMB_P','LEAD','ENTRY'].map(h => (
+                                        <span key={h} style={{ fontSize: 9, color: '#4b5563', fontWeight: 700,
+                                          letterSpacing: '0.08em', padding: '5px 0 3px' }}>{h}</span>
+                                      ))}
+                                      {cached!.open_ladders_list.map(l => (
+                                        <Fragment key={l.ladder_id}>
+                                          <span style={{ fontFamily: 'monospace', fontSize: 11, fontWeight: 600, color: '#60a5fa', paddingBottom: 5 }}>{l.city}</span>
+                                          <span style={{ fontSize: 10, color: '#a5b4fc', fontFamily: 'monospace', paddingBottom: 5 }}>{l.target_date}</span>
+                                          <span style={{ fontSize: 11, color: '#e2e8f0', paddingBottom: 5 }}>{l.legs}</span>
+                                          <span style={{ fontSize: 11, color: '#94a3b8', paddingBottom: 5 }}>{l.sum_price.toFixed(4)}</span>
+                                          <span style={{ fontSize: 11, fontWeight: 700, color: '#fbbf24', paddingBottom: 5 }}>{l.payout_ratio.toFixed(0)}x</span>
+                                          <span style={{ fontSize: 11, color: '#94a3b8', paddingBottom: 5 }}>{l.combined_p.toFixed(3)}</span>
+                                          <span style={{ fontSize: 11, color: '#8892a4', paddingBottom: 5 }}>{l.lead_days != null ? `${l.lead_days}d` : '—'}</span>
+                                          <span style={{ fontSize: 10, color: '#64748b', fontFamily: 'monospace', paddingBottom: 5 }}>{l.entry_ts?.slice(11, 19)}</span>
+                                        </Fragment>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* Stats strip */}
+                                {cached && (
+                                  <div style={{ display: 'flex', gap: 12, fontSize: 11, color: '#8892a4', flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+                                    <span><span style={{ color: '#64748b' }}>Alloc </span>
+                                      <strong style={{ color: '#e2e8f0' }}>{cached.initial_allocated_usdc.toFixed(0)} USDC</strong></span>
+                                    <span>HTR <strong style={{ color: '#34d399' }}>{cached.htr_count}</strong>
+                                      {' '}· CAT <strong style={{ color: '#f87171' }}>{cached.cat_count}</strong></span>
+                                    <span><span style={{ color: '#64748b' }}>avg payout </span>
+                                      <strong style={{ color: '#fbbf24' }}>{cached.avg_payout_ratio.toFixed(0)}x</strong></span>
+                                  </div>
+                                )}
+
+                                {/* Filter + trade log */}
+                                {allTrades.length > 0 && (
+                                  <>
+                                    <div style={{ display: 'flex', gap: 4, marginBottom: 8, borderTop: '1px solid #141428', paddingTop: 10 }}>
+                                      {([
+                                        ['all',   'All',    allTrades.length,   '#94a3b8'],
+                                        ['entry', 'Open',   entryTrades.length, '#60a5fa'],
+                                        ['exit',  'Closed', exitTrades.length,  '#a78bfa'],
+                                      ] as [string, string, number, string][]).map(([f, label, count, color]) => (
+                                        <button key={f}
+                                          onClick={e => {
+                                            e.stopPropagation()
+                                            setLadderFilterMap(prev => ({ ...prev, [s.strategy_id]: f }))
+                                            setPageMap(prev => ({ ...prev, [`l_${s.strategy_id}`]: 0 }))
+                                          }}
+                                          style={{
+                                            background: activeFilter === f ? '#1e1e42' : 'transparent',
+                                            border: `1px solid ${activeFilter === f ? '#818cf8' : '#2e3348'}`,
+                                            borderRadius: 4, padding: '3px 10px', cursor: 'pointer',
+                                            fontSize: 11, fontWeight: 600,
+                                            color: activeFilter === f ? '#e2e8f0' : '#8892a4',
+                                            display: 'inline-flex', alignItems: 'center', gap: 5,
+                                          }}
+                                        >
+                                          {label}
+                                          {count > 0 && <span style={{ background: '#0e0e1a', borderRadius: 8, padding: '0 5px', fontSize: 10, color }}>{count}</span>}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    {filteredTrades.length === 0
+                                      ? <p style={{ color: '#8892a4', fontSize: 11, padding: '4px 0' }}>— 無紀錄</p>
+                                      : (
+                                        <>
+                                          <div className="table-wrap">
+                                            <table>
+                                              <thead><tr>
+                                                <th>Time</th><th>City</th><th>Date</th>
+                                                <th>Action</th><th>Leg</th><th>Price</th>
+                                                <th>Payout</th><th>Comb_P</th><th>Lead</th><th>PnL</th>
+                                              </tr></thead>
+                                              <tbody>
+                                                {shownTrades.map(t => (
+                                                  <tr key={t.id}
+                                                    className={t.realized_pnl_usdc != null ? (t.realized_pnl_usdc >= 0 ? 'row-win' : 'row-loss') : t.action === 'LADDER_ENTRY' ? 'row-win' : ''}>
+                                                    <td className="ts">{t.ts?.slice(11, 19) ?? '—'}</td>
+                                                    <td style={{ fontFamily: 'monospace', fontSize: 11, color: '#60a5fa' }}>{t.city}</td>
+                                                    <td style={{ fontSize: 10, color: '#a5b4fc', fontFamily: 'monospace' }}>{t.target_date}</td>
+                                                    <td><LadderActionBadge action={t.action} /></td>
+                                                    <td style={{ color: '#64748b', fontSize: 11 }}>{t.leg_index}</td>
+                                                    <td>{t.price.toFixed(4)}</td>
+                                                    <td style={{ color: '#fbbf24', fontWeight: 700 }}>{t.payout_ratio > 0 ? `${t.payout_ratio.toFixed(0)}x` : '—'}</td>
+                                                    <td style={{ color: '#94a3b8' }}>{t.combined_p.toFixed(3)}</td>
+                                                    <td>{t.lead_days != null ? `${t.lead_days}d` : '—'}</td>
+                                                    <td className={t.realized_pnl_usdc != null ? (t.realized_pnl_usdc >= 0 ? 'green' : 'red') : ''}>
+                                                      {t.realized_pnl_usdc != null ? usd(t.realized_pnl_usdc) : '—'}
+                                                    </td>
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                          {filteredTrades.length > pageSize && (
+                                            <Paginator
+                                              total={filteredTrades.length}
+                                              page={page} pageSize={pageSize}
+                                              onPage={p => setPageMap(prev => ({ ...prev, [`l_${s.strategy_id}`]: p }))}
+                                              onPageSize={n => {
+                                                setPageSizeMap(prev => ({ ...prev, [`l_${s.strategy_id}`]: n }))
+                                                setPageMap(prev => ({ ...prev, [`l_${s.strategy_id}`]: 0 }))
+                                              }}
+                                            />
+                                          )}
+                                        </>
+                                      )}
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+      </section>
     </>
   )
 }

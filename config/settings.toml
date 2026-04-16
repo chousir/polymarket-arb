@@ -36,7 +36,7 @@ circuit_breaker_loss_pct  = 0.20
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [capital]
-initial_capital_usdc = 10000.0
+initial_capital_usdc = 100000.0
 taker_fee_pct        = 0.018
 gas_fee_usdc         = 0.005
 
@@ -243,238 +243,176 @@ max_spread              = 0.05
 # ───────────────────────────────────────────────────────────────────────────────
 # type = "weather"：科學氣象模型 vs 群眾直覺，尋找邊際並下注。
 #
-# 成本計算（每次入場）：
+# ── 市場類型 ──────────────────────────────────────────────────────────────────
+#   TempRange  — slug 無修飾詞（如 -12c）：最高溫是否為某°C？
+#                確定性模型(GFS/NWS/ECMWF) p_yes 上限 ≈ 0.26（1°C 帶 normal CDF）
+#                Ensemble 直接數成員，p_yes 可達任意值
+#   Extreme    — slug 含 forhigher / forbelow：最高溫是否達門檻以上/以下？
+#                p_yes 為尾端機率，0–1 均可出現
+#
+# ── BUY_YES 進場信心閘門 ───────────────────────────────────────────────────────
+#   TempRange（GFS/NWS/ECMWF）: p_yes ≥ min_temprange_p_yes（預設 0.26）
+#   TempRange（Ensemble）      : p_yes ≥ min_model_confidence（需 ≥65% 成員一致）
+#   Extreme（所有模型）        : p_yes ≥ min_model_confidence
+#   BUY_NO（TempRange）        : (1-p_yes) ≥ min_model_confidence_temprange
+#
+# ── 動態止損（stop_loss_delta）────────────────────────────────────────────────
+#   lead_days = 1（結算日當天）: 使用 stop_loss_delta
+#   lead_days > 1（提前進場）  : 使用 stop_loss_delta × 2
+#   ⚠ 提前進場持倉會經歷隔夜預報更新，波動遠大於當日市場，固定止損
+#     容易在方向正確時被暫時波動掃出（如 London 13°C overnight 案例）。
+#
+# ── 成本計算 ──────────────────────────────────────────────────────────────────
 #   cost_frac = (taker_fee_bps + slippage_buffer_bps) / 10_000 × 2
 #   edge      = model_p_yes − market_ask − cost_frac
 #   入場條件  : edge >= min_net_edge_bps / 10_000
 #
-# 動態平倉觸發：
+# ── 動態平倉觸發 ──────────────────────────────────────────────────────────────
 #   TAKE_PROFIT      — 持倉 bid ≥ 入場價 + 目標利潤
-#   STOP_LOSS        — 持倉 ask ≤ 入場價 − stop_loss_delta
+#   STOP_LOSS        — 持倉 ask ≤ 入場價 − stop_loss_delta（lead>1 則 ×2）
 #   TIME_DECAY_EXIT  — 距收盤 < abort_before_close_sec
-#   FORECAST_SHIFT   — 新預測 p_yes 偏移 ≥ forecast_shift_threshold
+#   FORECAST_SHIFT   — 新預測 p_yes 偏移 ≥ forecast_shift_threshold（trailing-best）
 #
-# 城市白名單（city_whitelist）：
+# ── 城市白名單（city_whitelist）──────────────────────────────────────────────
 #   空陣列 = 接受所有支援城市（NYC, London, Miami, Chicago, LA, Paris,
 #             Tokyo, Sydney, Toronto, Dubai）
 #   指定陣列 = 只交易列出的城市
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 灰度：單城市（NYC），嚴格參數，驗證 GFS 邊際品質
+# 驗證 GFS 邊際品質
 [[strategies]]
-id                          = "weather_nyc_gfs_v1"
+id                          = "weather_nyc_gfs"
 type                        = "weather"
 enabled                     = true             # Phase 5 驗證後啟用
-capital_allocation_pct      = 0.05              # 使用 5% 總資金（灰度）
+capital_allocation_pct      = 0.10              # 使用 5% 總資金（灰度）
 trade_size_pct              = 0.05              # 每次只用可用資金 5%
 max_drawdown_pct            = 0.20
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 60.0             # 天氣市場流動性較低，多留緩衝
-min_net_edge_bps            = 1000.0            # 嚴格：10% 邊際才入場
+slippage_buffer_bps         = 40.0
+min_net_edge_bps            = 650.0            # high 組保持高質量但從 800 下修到可達範圍
 max_spread                  = 0.06
-stop_loss_delta             = 0.06
-min_model_confidence        = 0.65             # 模型信心需 ≥ 65% 或 ≤ 35%
-weather_min_depth_usdc      = 75.0             # 比預設更高的流動性門檻
-weather_min_lead_days       = 1
-weather_max_lead_days       = 7                # 只交易 7 天內（GFS 有效範圍）
+stop_loss_delta             = 0.09             # 比 low 稍緊，但仍給足緩衝
+min_model_confidence        = 0.65
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 0
+weather_max_lead_days       = 5                # GFS 5天內精度最佳
 city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Houston", "Dallas", "Boston", "Seattle", "Atlanta"]
 weather_forecast_model      = "gfs"
-forecast_shift_threshold    = 0.15
+forecast_shift_threshold    = 0.15             # GFS 每6h更新，比NWS穩定，0.12→0.15
+min_temprange_p_yes         = 0.26
 
 # 美國限定：只使用 NWS/NOAA 覆蓋的城市
 [[strategies]]
 id                          = "weather_nws_direct"
 type                        = "weather"
 enabled                     = true
-capital_allocation_pct      = 0.05
+capital_allocation_pct      = 0.10
 trade_size_pct              = 0.05
 max_drawdown_pct            = 0.25
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 50.0
-min_net_edge_bps            = 800.0
+slippage_buffer_bps         = 35.0
+min_net_edge_bps            = 650.0
 max_spread                  = 0.05
-stop_loss_delta             = 0.06
-min_model_confidence        = 0.65
-weather_min_depth_usdc      = 75.0
-weather_min_lead_days       = 1
-weather_max_lead_days       = 7
+stop_loss_delta             = 0.10
+min_model_confidence        = 0.80
+weather_min_depth_usdc      = 50.0
+weather_min_lead_days       = 0
+weather_max_lead_days       = 3                # NWS 有效窗口 0-3 天
 city_whitelist              = ["NYC", "Miami", "Chicago", "LA", "Houston", "Phoenix", "San Francisco", "Boston", "Seattle", "Atlanta", "Dallas", "Denver"]
 weather_forecast_model      = "nws"
-forecast_shift_threshold    = 0.15
+forecast_shift_threshold    = 0.18             # NWS逐小時更新，同日噪聲最高（Dallas案例），0.12→0.18
+min_temprange_p_yes         = 0.26
 
 # 標準版：多城市，ECMWF 精度範圍（2–5 天），中等閾值
 [[strategies]]
 id                          = "weather_ecmwf_global"
 type                        = "weather"
 enabled                     = true
-capital_allocation_pct      = 0.05
+capital_allocation_pct      = 0.10
 trade_size_pct              = 0.05
 max_drawdown_pct            = 0.25
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 50.0
-min_net_edge_bps            = 800.0
+slippage_buffer_bps         = 40.0
+min_net_edge_bps            = 650.0
 max_spread                  = 0.07
-stop_loss_delta             = 0.07
-min_model_confidence        = 0.62
+stop_loss_delta             = 0.09
+min_model_confidence        = 0.65
 weather_min_depth_usdc      = 50.0
-weather_min_lead_days       = 2
+weather_min_lead_days       = 0
 weather_max_lead_days       = 5                # ECMWF 最佳精度範圍
 city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Tokyo", "Sydney", "Paris", "Toronto", "Dubai", "Seoul", "Boston", "Houston"]
 weather_forecast_model      = "ecmwf"
-forecast_shift_threshold    = 0.12             # 更敏感的平倉觸發
+forecast_shift_threshold    = 0.15             # ECMWF每12h更新最穩定，對齊_low，0.12→0.15
+min_temprange_p_yes         = 0.26
 
 # Ensemble 機率版：直接用 50+ 成員統計 p_yes（高流動性城市優先）
 [[strategies]]
 id                          = "weather_ensemble_prob"
 type                        = "weather"
 enabled                     = true
-capital_allocation_pct      = 0.05
+capital_allocation_pct      = 0.10
 trade_size_pct              = 0.05
 max_drawdown_pct            = 0.25
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 50.0
-min_net_edge_bps            = 1000.0           # 較高門檻，確保扣成本後仍有優勢
+slippage_buffer_bps         = 40.0
+min_net_edge_bps            = 650.0
 max_spread                  = 0.06
 stop_loss_delta             = 0.12
-min_model_confidence        = 0.70
+min_model_confidence        = 0.63            # 現在 30 成員機率有意義
 weather_min_depth_usdc      = 50.0
-weather_min_lead_days       = 1
+weather_min_lead_days       = 0
 weather_max_lead_days       = 7
 city_whitelist              = ["NYC", "London", "Tokyo", "Miami", "Chicago", "LA", "Sydney", "Toronto", "Paris", "Dubai"]
 weather_forecast_model      = "ensemble"
-forecast_shift_threshold    = 0.12
+forecast_shift_threshold    = 0.15             # Ensemble p_yes已平滑(多成員)，對齊_low，0.12→0.15
+min_temprange_p_yes         = 0.26            # 沒有作用，這是成員國投票不是預測機率，皆使用min_model_confidence
 
 # 多模型共識版：僅在 GFS/ECMWF/Ensemble 三者分歧 < 10% 時進場
-[[strategies]]
-id                          = "weather_multi_consensus"
-type                        = "weather"
-enabled                     = false            # 改用 A/B 兩組參數版
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.05
-max_drawdown_pct            = 0.20
-taker_fee_bps               = 180.0
-slippage_buffer_bps         = 50.0
-min_net_edge_bps            = 600.0
-max_spread                  = 0.06
-stop_loss_delta             = 0.15
-min_model_confidence        = 0.60
-weather_min_depth_usdc      = 50.0
-weather_min_lead_days       = 1
-weather_max_lead_days       = 7
-city_whitelist              = ["NYC", "London"]
-weather_forecast_model      = "consensus"
-forecast_shift_threshold    = 0.15
-consensus_max_divergence    = 0.10
-
 # A/B 測試 A 組（保守）：高邊際 + 高信心 + 嚴格流動性
 [[strategies]]
 id                          = "weather_multi_consensus_conservative"
 type                        = "weather"
 enabled                     = true
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.04
+capital_allocation_pct      = 0.10
+trade_size_pct              = 0.05
 max_drawdown_pct            = 0.18
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 60.0
-min_net_edge_bps            = 900.0
+slippage_buffer_bps         = 45.0
+min_net_edge_bps            = 700.0            # 900 幾乎從不觸發，改為可達但嚴格
 max_spread                  = 0.05
-stop_loss_delta             = 0.12
+stop_loss_delta             = 0.15
 min_model_confidence        = 0.68
-weather_min_depth_usdc      = 80.0
-weather_min_lead_days       = 1
-weather_max_lead_days       = 7
+weather_min_depth_usdc      = 60.0             # 80 卡死太多市場，降至 60
+weather_min_lead_days       = 0
+weather_max_lead_days       = 5                # consensus 三模型最佳交集範圍
 city_whitelist              = ["NYC", "London", "Miami", "Chicago", "Tokyo", "Sydney"]
 weather_forecast_model      = "consensus"
-forecast_shift_threshold    = 0.12
-consensus_max_divergence    = 0.08
-
-
-# A/B 測試 B 組（進取）：低邊際 + 較寬流動性門檻，提升進場頻率
-[[strategies]]
-id                          = "weather_multi_consensus_aggressive"
-type                        = "weather"
-enabled                     = true
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.07
-max_drawdown_pct            = 0.22
-taker_fee_bps               = 180.0
-slippage_buffer_bps         = 45.0
-min_net_edge_bps            = 500.0
-max_spread                  = 0.07
-stop_loss_delta             = 0.18
-min_model_confidence        = 0.58
-weather_min_depth_usdc      = 40.0
-weather_min_lead_days       = 1
-weather_max_lead_days       = 7
-city_whitelist              = ["NYC", "London", "Miami", "Chicago", "LA", "Tokyo", "Sydney", "Paris", "Toronto", "Dubai"]
-weather_forecast_model      = "consensus"
-forecast_shift_threshold    = 0.18
-consensus_max_divergence    = 0.15
+forecast_shift_threshold    = 0.18             # 三模型平均最穩定，但0.12仍偏緊，0.12→0.15
+min_temprange_p_yes         = 0.26
+consensus_max_divergence    = 0.10
 
 # METAR 短線版：METAR 即時觀測 + NWS/GFS 短期預測，只做 24h 內到期市場
+# A/B 測試 A 組（保守）：提高邊際與流動性門檻，降低回撤
 [[strategies]]
 id                          = "weather_metar_short"
 type                        = "weather"
-enabled                     = false            # 改用 A/B 兩組參數版
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.05
-max_drawdown_pct            = 0.20
-taker_fee_bps               = 180.0
-slippage_buffer_bps         = 60.0
-min_net_edge_bps            = 700.0
-max_spread                  = 0.07
-stop_loss_delta             = 0.10
-min_model_confidence        = 0.62
-weather_min_depth_usdc      = 60.0
-weather_min_lead_days       = 0
-weather_max_lead_days       = 1
-city_whitelist              = []               # 空陣列 = 所有支援且有 ICAO 的城市
-weather_forecast_model      = "metar_short"
-forecast_shift_threshold    = 0.10
-loop_interval_sec           = 300
-
-# A/B 測試 A 組（保守）：提高邊際與流動性門檻，降低回撤
-[[strategies]]
-id                          = "weather_metar_short_conservative"
-type                        = "weather"
 enabled                     = true
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.04
+capital_allocation_pct      = 0.10
+trade_size_pct              = 0.05
 max_drawdown_pct            = 0.18
 taker_fee_bps               = 180.0
-slippage_buffer_bps         = 65.0
-min_net_edge_bps            = 900.0
+slippage_buffer_bps         = 50.0             # METAR 短線市場流動性較差，保留緩衝
+min_net_edge_bps            = 700.0            # 900 觸發率過低
 max_spread                  = 0.06
-stop_loss_delta             = 0.09
-min_model_confidence        = 0.68
-weather_min_depth_usdc      = 80.0
+stop_loss_delta             = 0.10             # 短線市場仍需緩衝，略微放寬
+min_model_confidence        = 0.70             # METAR 同日精度高，可要求更高信心
+weather_min_depth_usdc      = 60.0             # 80 → 60
 weather_min_lead_days       = 0
 weather_max_lead_days       = 1
 city_whitelist              = []               # 所有支援且有 ICAO 的城市
 weather_forecast_model      = "metar_short"
 forecast_shift_threshold    = 0.08
-loop_interval_sec           = 300
-
-# A/B 測試 B 組（進取）：降低進場門檻，提高進場頻率
-[[strategies]]
-id                          = "weather_metar_short_aggressive"
-type                        = "weather"
-enabled                     = true
-capital_allocation_pct      = 0.05
-trade_size_pct              = 0.07
-max_drawdown_pct            = 0.24
-taker_fee_bps               = 180.0
-slippage_buffer_bps         = 50.0
-min_net_edge_bps            = 500.0
-max_spread                  = 0.08
-stop_loss_delta             = 0.13
-min_model_confidence        = 0.58
-weather_min_depth_usdc      = 40.0
-weather_min_lead_days       = 0
-weather_max_lead_days       = 1
-city_whitelist              = []               # 所有支援且有 ICAO 的城市
-weather_forecast_model      = "metar_short"
-forecast_shift_threshold    = 0.12
+min_temprange_p_yes         = 0.26
 loop_interval_sec           = 300
 
 # 進階：全城市，允許更長預測期（需 ≥ 14 天穩定正收益後才考慮）
@@ -492,11 +430,103 @@ max_spread                  = 0.08
 stop_loss_delta             = 0.08
 min_model_confidence        = 0.60
 weather_min_depth_usdc      = 50.0
-weather_min_lead_days       = 1
+weather_min_lead_days       = 0
 weather_max_lead_days       = 10
 city_whitelist              = []               # 空陣列 = 接受所有支援城市
 weather_forecast_model      = "gfs"
 forecast_shift_threshold    = 0.15
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Weather Ladder 系列（Phase 5b）
+# ───────────────────────────────────────────────────────────────────────────────
+# type = "weather_ladder"：掃描連續精確溫度市場的低價群集，同時買入多腿，
+#   以高賠率（80x–500x）等待到期收割。
+#
+# 核心邏輯：
+#   sum_prices = 所有腿的入場價加總
+#   payout_ratio = 1 / sum_prices（只需一腿中獎即回本）
+#   combined_p_yes = GFS 預測各腿 p_yes 的總和（衡量至少一腿中獎的機率）
+#
+# 入場條件（全部須成立）：
+#   1. payout_ratio >= ladder_min_payout_ratio
+#   2. combined_p_yes >= ladder_min_combined_p_yes
+#   3. 每腿 ask 在 [ladder_min_leg_price, ladder_max_leg_price] 區間內
+#   4. 相鄰腿溫度差 <= 3°C（硬碼）
+#   5. 腿數 >= ladder_min_legs
+#
+# 平倉條件：
+#   HOLD_TO_RESOLUTION — 等市場到期，收割獲勝腿的 $1.00
+#   CATASTROPHIC_SHIFT_EXIT — GFS 預測 combined_p 下降超過 ladder_catastrophic_shift_threshold
+#
+# 參數說明：
+#   ladder_min_leg_price              — 每腿最低入場價（過低可能無流動性）
+#   ladder_max_leg_price              — 每腿最高入場價（過高則賠率不足）
+#   ladder_min_payout_ratio           — 最低要求賠率（倍數，1/sum_prices）
+#   ladder_min_combined_p_yes         — GFS 最低預測勝率（防止賭不可能的事件）
+#   ladder_min_legs / ladder_max_legs — 群集腿數範圍
+#   ladder_max_total_usdc             — 單次進場最大金額（所有腿合計）
+#   ladder_catastrophic_shift_threshold — GFS combined_p 下降此幅度即強制出場
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 驗證版：保守參數，高賠率要求，低資金，確認策略機制正常
+[[strategies]]
+id                                  = "weather_ladder_validate"
+type                                = "weather_ladder"
+enabled                             = false
+capital_allocation_pct              = 0.03              # 只用 3% 總資金驗證
+trade_size_pct                      = 0.05
+max_drawdown_pct                    = 0.25
+weather_min_lead_days               = 0
+weather_max_lead_days               = 7
+loop_interval_sec                   = 900               # 每 15 分鐘掃描一次
+ladder_min_leg_price                = 0.0010            # 最低 $0.001/腿
+ladder_max_leg_price                = 0.0200            # 最高 $0.02/腿（100x+ 潛力）
+ladder_min_payout_ratio             = 80.0              # 至少 80 倍賠率
+ladder_min_combined_p_yes           = 0.20              # GFS 至少 20% 總勝率
+ladder_min_legs                     = 3
+ladder_max_legs                     = 7
+ladder_max_total_usdc               = 3.0               # 單梯最大 $3（小倉驗證）
+ladder_catastrophic_shift_threshold = 0.35              # GFS 預測大跌 35% 才出場
+
+# 標準版：放寬入場，提升進場頻率，適度增加資金
+[[strategies]]
+id                                  = "weather_ladder_standard"
+type                                = "weather_ladder"
+enabled                             = false
+capital_allocation_pct              = 0.05
+trade_size_pct                      = 0.05
+max_drawdown_pct                    = 0.25
+weather_min_lead_days               = 0
+weather_max_lead_days               = 10
+loop_interval_sec                   = 600               # 每 10 分鐘掃描
+ladder_min_leg_price                = 0.0005
+ladder_max_leg_price                = 0.0500            # 放寬至 $0.05（20x+ 賠率）
+ladder_min_payout_ratio             = 40.0              # 降至 40 倍，進場更多機會
+ladder_min_combined_p_yes           = 0.25
+ladder_min_legs                     = 3
+ladder_max_legs                     = 9
+ladder_max_total_usdc               = 8.0
+ladder_catastrophic_shift_threshold = 0.30
+
+# 進取版：低賠率門檻，高進場頻率，需 ≥ 14 天正收益後才啟用
+[[strategies]]
+id                                  = "weather_ladder_aggressive"
+type                                = "weather_ladder"
+enabled                             = false             # 待驗證版穩定後再啟用
+capital_allocation_pct              = 0.05
+trade_size_pct                      = 0.05
+max_drawdown_pct                    = 0.30
+weather_min_lead_days               = 0
+weather_max_lead_days               = 14
+loop_interval_sec                   = 600
+ladder_min_leg_price                = 0.0003
+ladder_max_leg_price                = 0.1000            # 接受至 $0.10（10x 賠率）
+ladder_min_payout_ratio             = 15.0
+ladder_min_combined_p_yes           = 0.30
+ladder_min_legs                     = 2
+ladder_max_legs                     = 12
+ladder_max_total_usdc               = 15.0
+ladder_catastrophic_shift_threshold = 0.25
 
 [mention_live_gradual]
 enabled_keywords_week1  = ["crypto"]        # Week 1 只開 1 個 keyword

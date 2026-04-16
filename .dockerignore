@@ -11,40 +11,37 @@
 *~
 .DS_Store
 
-# Python
-__pycache__/
+# Python（遞迴排除所有子目錄）
+**/__pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-.mypy_cache/
+**/*.egg-info/
+**/dist/
+**/build/
+**/.pytest_cache/
+**/.mypy_cache/
+.venv/
 venv/
 env/
 ENV/
 
-# Node
-node_modules/
+# Node（遞迴排除，包含 python-analytics/.../node_modules）
+**/node_modules/
 npm-debug.log*
 yarn-error.log*
 .next/
-dist/
 
-# Rust
-target/
-Cargo.lock
+# Rust（遞迴排除，包含 rust-engine/target）
+**/target/
+# Cargo.lock 保留以確保可重現 build
 *.rlib
 *.rmeta
 *.so
 *.dylib
 
-# 文檔 & 草稿
+# 文檔 & 草稿（不需進容器）
 docs/
 *.md
-/polymarket-arb-plan.md
-/CLAUDE.md
-/README.md
 
 # 敏感檔案（即使 .gitignore 已列出）
 .env

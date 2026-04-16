@@ -1,4 +1,4 @@
-version: '3.8'
+name: polymarket-arb
 
 services:
   # ════════════════════════════════════════════════════════════════════════════
@@ -72,9 +72,6 @@ services:
     
     networks:
       - polymarket-net
-    
-    depends_on:
-      - engine
     
     restart: unless-stopped
     

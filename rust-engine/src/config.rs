@@ -78,6 +78,12 @@ struct RawStrategyConfig {
     // ── Weather-specific fields ────────────────────────────────────────────
     /// Minimum model probability required to trade either side (default 0.60)
     min_model_confidence: Option<f64>,
+    /// TempRange BUY_NO: (1-p_yes) must meet this threshold (default = min_model_confidence)
+    min_model_confidence_temprange: Option<f64>,
+    /// TempRange BUY_YES: p_yes must be at least this value (default 0.28)
+    min_temprange_p_yes: Option<f64>,
+    /// Minimum number of valid ensemble members required to use signal (default 10)
+    min_ensemble_members: Option<usize>,
     /// Minimum order-book depth in USDC for weather markets (default 50.0)
     weather_min_depth_usdc: Option<f64>,
     /// Minimum forecast lead time in days (default 1)
@@ -94,6 +100,15 @@ struct RawStrategyConfig {
     consensus_max_divergence: Option<f64>,
     /// Per-strategy loop interval in seconds (strategy-specific defaults)
     loop_interval_sec: Option<u64>,
+    // ── WeatherLadder 專用 ─────────────────────────────────────────────────
+    ladder_min_leg_price: Option<f64>,
+    ladder_max_leg_price: Option<f64>,
+    ladder_min_payout_ratio: Option<f64>,
+    ladder_min_combined_p_yes: Option<f64>,
+    ladder_min_legs: Option<i64>,
+    ladder_max_legs: Option<i64>,
+    ladder_max_total_usdc: Option<f64>,
+    ladder_catastrophic_shift_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +145,7 @@ pub enum StrategyType {
     PureArb,
     Mention,
     Weather,
+    WeatherLadder,
 }
 
 impl StrategyType {
@@ -140,6 +156,8 @@ impl StrategyType {
             StrategyType::Mention
         } else if s.eq_ignore_ascii_case("weather") {
             StrategyType::Weather
+        } else if s.eq_ignore_ascii_case("weather_ladder") {
+            StrategyType::WeatherLadder
         } else {
             StrategyType::DumpHedge
         }
@@ -186,8 +204,14 @@ pub struct StrategyConfig {
     pub min_net_edge_bps: f64,
     pub max_spread: f64,
     // ── Weather 專用 ──────────────────────────────────────────────────────────
-    /// Minimum model probability required to trade either side
+    /// Minimum model probability required to trade either side (Extreme / Precip)
     pub min_model_confidence: f64,
+    /// TempRange BUY_NO: (1-p_yes) must meet this threshold
+    pub min_model_confidence_temprange: f64,
+    /// TempRange BUY_YES: p_yes must be at least this value
+    pub min_temprange_p_yes: f64,
+    /// Minimum number of valid ensemble members required to use signal
+    pub min_ensemble_members: usize,
     /// Minimum order-book depth in USDC for weather markets
     pub weather_min_depth_usdc: f64,
     /// Minimum forecast lead time in days
@@ -204,6 +228,16 @@ pub struct StrategyConfig {
     pub consensus_max_divergence: f64,
     /// Background loop interval in seconds for strategies with polling loops
     pub loop_interval_sec: u64,
+
+    // ── WeatherLadder 專用 ─────────────────────────────────────────────────────
+    pub ladder_min_leg_price: f64,
+    pub ladder_max_leg_price: f64,
+    pub ladder_min_payout_ratio: f64,
+    pub ladder_min_combined_p_yes: f64,
+    pub ladder_min_legs: usize,
+    pub ladder_max_legs: usize,
+    pub ladder_max_total_usdc: f64,
+    pub ladder_catastrophic_shift_threshold: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -254,11 +288,21 @@ pub struct BotConfig {
     pub strategies: Vec<StrategyConfig>,
 }
 
+impl StrategyConfig {
+    /// Taker fee as a fraction (e.g. 180 bps → 0.018)
+    pub fn global_taker_fee(&self) -> f64 {
+        self.taker_fee_bps / 10_000.0
+    }
+}
+
 impl BotConfig {
     pub fn load() -> Result<Self, crate::error::AppError> {
         let _ = dotenvy::dotenv();
 
-        let config_path = format!("{}/../config/settings", env!("CARGO_MANIFEST_DIR"));
+        // Docker: CONFIG_PATH=/app/config/settings（由 Dockerfile ENV 設定）
+        // 本機開發：未設環境變數，fallback 到 Cargo.toml 相對路徑
+        let config_path = std::env::var("CONFIG_PATH")
+            .unwrap_or_else(|_| format!("{}/../config/settings", env!("CARGO_MANIFEST_DIR")));
 
         let raw: RawSettings = config::Config::builder()
             .add_source(config::File::with_name(&config_path))
@@ -279,6 +323,7 @@ impl BotConfig {
                 let default_loop_interval_sec = match strat_type {
                     StrategyType::Mention => 60,
                     StrategyType::Weather => 15 * 60,
+                    StrategyType::WeatherLadder => 3600,
                     StrategyType::DumpHedge | StrategyType::PureArb => 60,
                 };
                 StrategyConfig {
@@ -309,6 +354,10 @@ impl BotConfig {
                     max_spread: s.max_spread.unwrap_or(0.05),
                     // Weather-specific
                     min_model_confidence:     s.min_model_confidence.unwrap_or(0.60),
+                    min_model_confidence_temprange: s.min_model_confidence_temprange
+                        .unwrap_or_else(|| s.min_model_confidence.unwrap_or(0.60)),
+                    min_temprange_p_yes:      s.min_temprange_p_yes.unwrap_or(0.28),
+                    min_ensemble_members:     s.min_ensemble_members.unwrap_or(10),
                     weather_min_depth_usdc:   s.weather_min_depth_usdc.unwrap_or(50.0),
                     weather_min_lead_days:    s.weather_min_lead_days.unwrap_or(1),
                     weather_max_lead_days:    s.weather_max_lead_days.unwrap_or(14),
@@ -317,6 +366,15 @@ impl BotConfig {
                     forecast_shift_threshold: s.forecast_shift_threshold.unwrap_or(0.15),
                     consensus_max_divergence: s.consensus_max_divergence.unwrap_or(0.10),
                     loop_interval_sec:        s.loop_interval_sec.unwrap_or(default_loop_interval_sec),
+                    // WeatherLadder-specific
+                    ladder_min_leg_price:                 s.ladder_min_leg_price.unwrap_or(0.0002),
+                    ladder_max_leg_price:                 s.ladder_max_leg_price.unwrap_or(0.15),
+                    ladder_min_payout_ratio:              s.ladder_min_payout_ratio.unwrap_or(80.0),
+                    ladder_min_combined_p_yes:            s.ladder_min_combined_p_yes.unwrap_or(0.20),
+                    ladder_min_legs:                      s.ladder_min_legs.unwrap_or(3) as usize,
+                    ladder_max_legs:                      s.ladder_max_legs.unwrap_or(7) as usize,
+                    ladder_max_total_usdc:                s.ladder_max_total_usdc.unwrap_or(5.0),
+                    ladder_catastrophic_shift_threshold:  s.ladder_catastrophic_shift_threshold.unwrap_or(0.35),
                 }
             })
             .collect();

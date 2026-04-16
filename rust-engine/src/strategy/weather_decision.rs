@@ -55,9 +55,15 @@ pub struct WeatherDecisionConfig {
     pub slippage_buffer_bps: f64,
     /// Minimum net edge in basis points before entering a trade
     pub min_net_edge_bps: f64,
-    /// Minimum model probability required to trade either side.
-    /// E.g. 0.65 means we only trade when model says ≥ 65% or ≤ 35%.
+    /// Extreme / Precip markets: model must be this confident IN the trading direction.
+    /// BUY_YES requires p_yes ≥ this; BUY_NO requires (1-p_yes) ≥ this.
     pub min_model_confidence: f64,
+    /// TempRange BUY_NO: (1-p_yes) must be ≥ this value.
+    pub min_model_confidence_temprange: f64,
+    /// TempRange BUY_YES: p_yes must be ≥ this value (narrow band, max ~0.30).
+    pub min_temprange_p_yes: f64,
+    /// Minimum valid ensemble members required; fewer → signal rejected (default 10)
+    pub min_ensemble_members: usize,
     /// Maximum acceptable bid-ask spread (0.08 = 8 cents on a $1 token)
     pub max_spread: f64,
     /// Minimum order-book depth in USDC — thin books are rejected
@@ -137,18 +143,27 @@ pub fn evaluate(
 ///
 /// Used by consensus strategies that combine multiple model probabilities first,
 /// then apply a single edge decision against the live order book.
+/// `min_ensemble_members`: reject ensemble forecast if fewer valid members present.
 pub fn probability_yes(
     forecast: &WeatherForecast,
     market: &WeatherMarket,
+    min_ensemble_members: usize,
 ) -> Option<f64> {
     match market.market_type {
         WeatherMarketType::TempRange => {
-            let (lo, hi) = market.temp_range?;
-            if (hi - lo) <= 0.0 {
+            let (lo_raw, hi_raw) = market.temp_range?;
+            // Exact-temperature markets have lo == hi; use ±0.5°C window
+            let (lo, hi) = if (hi_raw - lo_raw).abs() < 0.01 {
+                (lo_raw - 0.5, hi_raw + 0.5)
+            } else {
+                (lo_raw, hi_raw)
+            };
+            if hi - lo <= 0.0 {
                 return None;
             }
 
             if forecast.model == WeatherModel::Ensemble {
+                if forecast.member_count() < min_ensemble_members { return None; }
                 forecast.ensemble_prob_in_range(lo, hi)
             } else {
                 let sigma = temp_model_sigma(forecast.model, forecast.lead_days);
@@ -159,6 +174,7 @@ pub fn probability_yes(
         WeatherMarketType::Extreme => {
             let (threshold, _) = market.temp_range?;
             if forecast.model == WeatherModel::Ensemble {
+                if forecast.member_count() < min_ensemble_members { return None; }
                 let p_above = forecast.ensemble_prob_above(threshold)?;
                 Some(if extreme_is_above(&market.question) { p_above } else { 1.0 - p_above })
             } else {
@@ -186,11 +202,20 @@ pub fn evaluate_temp_range(
     cfg: &WeatherDecisionConfig,
 ) -> WeatherSignal {
     let (lo, hi) = match market.temp_range {
-        Some(r) if (r.1 - r.0) > 0.0 => r,
-        _ => {
+        Some(r) => {
+            // Exact-temperature markets have lo == hi; use ±0.5°C window
+            if (r.1 - r.0).abs() < 0.01 {
+                (r.0 - 0.5, r.1 + 0.5)
+            } else if r.1 - r.0 > 0.0 {
+                r
+            } else {
+                return hold(0.0, "temp_range degenerate".into(), "NO_RANGE");
+            }
+        }
+        None => {
             return hold(
                 0.0,
-                "temp_range missing or degenerate".into(),
+                "temp_range missing".into(),
                 "NO_RANGE",
             )
         }
@@ -198,6 +223,12 @@ pub fn evaluate_temp_range(
 
     // Compute p_yes
     let p_yes = if forecast.model == WeatherModel::Ensemble {
+        let n = forecast.member_count();
+        if n < cfg.min_ensemble_members {
+            return hold(0.0,
+                format!("ensemble only {n} members (min {})", cfg.min_ensemble_members),
+                "FEW_MEMBERS");
+        }
         // Ensemble: direct fraction of members falling in [lo, hi]
         match forecast.ensemble_prob_in_range(lo, hi) {
             Some(p) => p,
@@ -210,7 +241,10 @@ pub fn evaluate_temp_range(
         normal_cdf((hi - mu) / sigma) - normal_cdf((lo - mu) / sigma)
     };
 
-    score_signal(p_yes, forecast, snapshot, cfg, lo, hi)
+    // Ensemble uses direct member counting so p_yes can exceed the ~0.26 CDF ceiling.
+    // Require min_model_confidence (not min_temprange_p_yes) for Ensemble TempRange.
+    let is_narrow_temprange = forecast.model != WeatherModel::Ensemble;
+    score_signal(p_yes, forecast, snapshot, cfg, lo, hi, is_narrow_temprange)
 }
 
 // ── Extreme evaluator ─────────────────────────────────────────────────────────
@@ -230,6 +264,12 @@ fn evaluate_extreme(
     let is_above = extreme_is_above(&market.question);
 
     let p_yes = if forecast.model == WeatherModel::Ensemble {
+        let n = forecast.member_count();
+        if n < cfg.min_ensemble_members {
+            return hold(0.0,
+                format!("ensemble only {n} members (min {})", cfg.min_ensemble_members),
+                "FEW_MEMBERS");
+        }
         let prob = if is_above {
             forecast.ensemble_prob_above(threshold)
         } else {
@@ -247,7 +287,7 @@ fn evaluate_extreme(
     };
 
     let (lo, hi) = (threshold, threshold);
-    score_signal(p_yes, forecast, snapshot, cfg, lo, hi)
+    score_signal(p_yes, forecast, snapshot, cfg, lo, hi, false)
 }
 
 // ── Precip evaluator ──────────────────────────────────────────────────────────
@@ -261,7 +301,7 @@ fn evaluate_precip(
     let p_yes = forecast.prob_precip; // already 0.0–1.0
 
     // Use dummy range (0,0) — threshold doesn't apply for precip
-    score_signal(p_yes, forecast, snapshot, cfg, 0.0, 0.0)
+    score_signal(p_yes, forecast, snapshot, cfg, 0.0, 0.0, false)
 }
 
 // ── Shared scoring logic ──────────────────────────────────────────────────────
@@ -273,21 +313,8 @@ fn score_signal(
     cfg: &WeatherDecisionConfig,
     lo: f64,
     hi: f64,
+    is_temprange: bool,
 ) -> WeatherSignal {
-    // Confidence gate: if the model is too uncertain, skip
-    if p_yes > (1.0 - cfg.min_model_confidence) && p_yes < cfg.min_model_confidence {
-        return hold(
-            p_yes,
-            format!(
-                "model confidence p_yes={:.3} between [{:.3},{:.3}]",
-                p_yes,
-                1.0 - cfg.min_model_confidence,
-                cfg.min_model_confidence
-            ),
-            "LOW_CONFIDENCE",
-        );
-    }
-
     let cost_frac = (cfg.taker_fee_bps + cfg.slippage_buffer_bps) / 10_000.0;
     let min_edge = cfg.min_net_edge_bps / 10_000.0;
 
@@ -295,6 +322,19 @@ fn score_signal(
     let edge_no  = (1.0 - p_yes) - snapshot.no_best_ask - cost_frac * 2.0;
 
     if edge_yes >= min_edge && edge_yes >= edge_no {
+        // Direction-specific confidence gate for BUY_YES
+        let min_conf = if is_temprange { cfg.min_temprange_p_yes } else { cfg.min_model_confidence };
+        if p_yes < min_conf {
+            return hold(
+                p_yes,
+                format!(
+                    "BUY_YES blocked: p_yes={:.3} < min={:.3} ({})",
+                    p_yes, min_conf,
+                    if is_temprange { "temprange" } else { "extreme" }
+                ),
+                "LOW_CONFIDENCE",
+            );
+        }
         WeatherSignal {
             direction:   WeatherDirection::BuyYes,
             edge_bps:    edge_yes * 10_000.0,
@@ -308,6 +348,23 @@ fn score_signal(
             reason_code: "BUY_YES".into(),
         }
     } else if edge_no >= min_edge {
+        // Direction-specific confidence gate for BUY_NO
+        let min_conf_no = if is_temprange {
+            cfg.min_model_confidence_temprange
+        } else {
+            cfg.min_model_confidence
+        };
+        if (1.0 - p_yes) < min_conf_no {
+            return hold(
+                p_yes,
+                format!(
+                    "BUY_NO blocked: (1-p_yes)={:.3} < min={:.3} ({})",
+                    1.0 - p_yes, min_conf_no,
+                    if is_temprange { "temprange" } else { "extreme" }
+                ),
+                "LOW_CONFIDENCE",
+            );
+        }
         WeatherSignal {
             direction:   WeatherDirection::BuyNo,
             edge_bps:    edge_no * 10_000.0,
@@ -353,7 +410,15 @@ fn hold(p_yes: f64, reason: String, reason_code: &str) -> WeatherSignal {
 /// will replace them with per-city empirical estimates.
 pub fn temp_model_sigma(model: WeatherModel, lead_days: u32) -> f64 {
     match (model, lead_days) {
-        // All models are very accurate same-day and next-day
+        // MetarShort uses the CURRENT observation as the daily-max anchor.
+        // A noon reading of 14°C can easily peak at 17-18°C later — the
+        // uncertainty between current observation and eventual daily max is
+        // much larger than a proper model forecast RMSE.
+        //   lead=0: same-day, obs already partially constrains daily max → 2.5°C
+        //   lead=1: next-day, today's obs says very little about tomorrow    → 3.5°C
+        (WeatherModel::MetarShort, 0) => 2.5,
+        (WeatherModel::MetarShort, _) => 3.5,
+        // NWS / GFS / ECMWF deterministic models — very accurate short range
         (_, 0..=1) => 1.5,
         // ECMWF IFS is more accurate than GFS in medium range
         (WeatherModel::Ecmwf, 2..=4) => 2.5,
@@ -463,11 +528,15 @@ mod tests {
 
     #[test]
     fn same_day_sigma() {
-        // All models should share the short-range sigma
+        // NWS/GFS/ECMWF/Ensemble share the tight short-range sigma
         for model in [WeatherModel::Nws, WeatherModel::Gfs, WeatherModel::Ecmwf, WeatherModel::Ensemble] {
             assert!((temp_model_sigma(model, 0) - 1.5).abs() < 1e-9);
             assert!((temp_model_sigma(model, 1) - 1.5).abs() < 1e-9);
         }
+        // MetarShort uses a wider sigma because current obs ≠ daily max
+        assert!((temp_model_sigma(WeatherModel::MetarShort, 0) - 2.5).abs() < 1e-9);
+        assert!((temp_model_sigma(WeatherModel::MetarShort, 1) - 3.5).abs() < 1e-9);
+        assert!(temp_model_sigma(WeatherModel::MetarShort, 0) > temp_model_sigma(WeatherModel::Gfs, 0));
     }
 
     // ── extreme_is_above ──────────────────────────────────────────────────────
@@ -515,6 +584,7 @@ mod tests {
             token_id_yes: "yes_token".into(),
             token_id_no: "no_token".into(),
             close_ts: (Utc::now().timestamp() + 86400) as u64,
+            liquidity_clob: 100.0,
         }
     }
 
@@ -534,6 +604,9 @@ mod tests {
             slippage_buffer_bps: 50.0,
             min_net_edge_bps: 800.0,
             min_model_confidence: 0.60,
+            min_model_confidence_temprange: 0.60,
+            min_temprange_p_yes: 0.28,
+            min_ensemble_members: 10,
             max_spread: 0.08,
             min_depth_usdc: 50.0,
             bet_size_usdc: 20.0,
@@ -692,6 +765,7 @@ mod tests {
             token_id_yes: "yes_token".into(),
             token_id_no: "no_token".into(),
             close_ts: (Utc::now().timestamp() + 86400) as u64,
+            liquidity_clob: 100.0,
         };
 
         let snapshot = make_snapshot(0.55, 0.48, 200.0);

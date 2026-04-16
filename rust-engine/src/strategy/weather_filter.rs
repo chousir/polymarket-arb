@@ -227,6 +227,7 @@ mod tests {
             token_id_yes:  "yes_token".into(),
             token_id_no:   "no_token".into(),
             close_ts,
+            liquidity_clob: 100.0,
         }
     }
 

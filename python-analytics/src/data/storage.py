@@ -81,6 +81,31 @@ class WeatherDryRunTrade:
 
 
 @dataclass
+class WeatherLadderTrade:
+    id: int
+    ts: str
+    strategy_id: str
+    ladder_id: str
+    market_slug: str
+    city: str
+    target_date: str
+    action: str               # LADDER_ENTRY | HOLD_TO_RESOLUTION | CATASTROPHIC_SHIFT_EXIT
+    leg_index: int
+    price: float
+    size_usdc: float
+    p_yes: Optional[float]
+    lead_days: Optional[int]
+    ladder_legs: int
+    ladder_sum_price: float
+    ladder_payout_ratio: float
+    ladder_combined_p: float
+    realized_pnl_usdc: Optional[float]
+    model: str
+    reason_code: str
+    note: Optional[str]
+
+
+@dataclass
 class CycleResult:
     id: int
     strategy_id: str
@@ -192,6 +217,34 @@ class DbReader:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_weather_trade(r) for r in rows]
 
+    # ── Weather Ladder trades ─────────────────────────────────────────────────
+
+    def get_weather_ladder_trades(
+        self,
+        days: Optional[int] = None,
+        strategy_id: Optional[str] = None,
+    ) -> "list[WeatherLadderTrade]":
+        """Return weather_ladder_trades, optionally filtered by time / strategy."""
+        conditions = []
+        params: list = []
+
+        if days is not None:
+            conditions.append("ts >= datetime('now', ?)")
+            params.append(f"-{days} days")
+        if strategy_id is not None:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT * FROM weather_ladder_trades {where} ORDER BY ts"
+
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            return [_row_to_ladder_trade(r) for r in rows]
+        except Exception:
+            return []
+
     # ── Cycles ────────────────────────────────────────────────────────────────
 
     def get_cycle_results(
@@ -258,6 +311,36 @@ class DbReader:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _row_to_ladder_trade(r: sqlite3.Row) -> WeatherLadderTrade:
+    def _f(key: str) -> Optional[float]:
+        v = r[key]; return float(v) if v is not None else None
+    def _i(key: str) -> Optional[int]:
+        v = r[key]; return int(v) if v is not None else None
+    return WeatherLadderTrade(
+        id=r["id"],
+        ts=r["ts"] or "",
+        strategy_id=r["strategy_id"],
+        ladder_id=r["ladder_id"],
+        market_slug=r["market_slug"],
+        city=r["city"] or "",
+        target_date=r["target_date"] or "",
+        action=r["action"],
+        leg_index=int(r["leg_index"]),
+        price=float(r["price"]),
+        size_usdc=float(r["size_usdc"]),
+        p_yes=_f("p_yes"),
+        lead_days=_i("lead_days"),
+        ladder_legs=int(r["ladder_legs"]),
+        ladder_sum_price=float(r["ladder_sum_price"]),
+        ladder_payout_ratio=float(r["ladder_payout_ratio"]),
+        ladder_combined_p=float(r["ladder_combined_p"]),
+        realized_pnl_usdc=_f("realized_pnl_usdc"),
+        model=r["model"] or "gfs",
+        reason_code=r["reason_code"] or "",
+        note=r["note"],
+    )
 
 
 def _row_to_weather_trade(r: sqlite3.Row) -> WeatherDryRunTrade:

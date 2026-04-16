@@ -74,6 +74,33 @@ pub struct WeatherDryRunTrade {
     pub note: Option<String>,
 }
 
+/// One leg of a ladder entry (or the exit record).
+/// action: LADDER_ENTRY | HOLD_TO_RESOLUTION | CATASTROPHIC_SHIFT_EXIT | NO_TRADE
+#[derive(Debug, Clone)]
+pub struct WeatherLadderTrade {
+    pub strategy_id: String,
+    pub ladder_id: String,       // UUID grouping all legs
+    pub market_slug: String,
+    pub city: String,
+    pub target_date: String,     // YYYY-MM-DD
+    pub action: String,
+    pub leg_index: i64,          // 0-based index within ladder
+    pub price: f64,
+    pub size_usdc: f64,
+    pub p_yes: Option<f64>,
+    pub lead_days: Option<i64>,
+    // Ladder-level stats (same for all legs in same ladder_id on entry)
+    pub ladder_legs: i64,
+    pub ladder_sum_price: f64,
+    pub ladder_payout_ratio: f64,
+    pub ladder_combined_p: f64,
+    // Exit fields
+    pub realized_pnl_usdc: Option<f64>,
+    pub model: String,
+    pub reason_code: String,
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DryRunTrade {
     pub strategy_id: String,
@@ -226,6 +253,36 @@ impl DbWriter {
                     trade.realized_pnl_usdc,
                     trade.reason_code,
                     trade.note,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::error::AppError::Other(e.to_string()))?
+        .map_err(crate::error::AppError::DbError)
+    }
+
+    pub async fn write_weather_ladder_trade(
+        &self,
+        trade: &WeatherLadderTrade,
+    ) -> Result<(), crate::error::AppError> {
+        let conn = Arc::clone(&self.conn);
+        let trade = trade.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock().expect("SQLite mutex poisoned");
+            conn.execute(
+                "INSERT INTO weather_ladder_trades \
+                 (strategy_id, ladder_id, market_slug, city, target_date, action, leg_index, \
+                  price, size_usdc, p_yes, lead_days, ladder_legs, ladder_sum_price, \
+                  ladder_payout_ratio, ladder_combined_p, realized_pnl_usdc, model, reason_code, note) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                rusqlite::params![
+                    trade.strategy_id, trade.ladder_id, trade.market_slug, trade.city,
+                    trade.target_date, trade.action, trade.leg_index,
+                    trade.price, trade.size_usdc, trade.p_yes, trade.lead_days,
+                    trade.ladder_legs, trade.ladder_sum_price, trade.ladder_payout_ratio,
+                    trade.ladder_combined_p, trade.realized_pnl_usdc, trade.model,
+                    trade.reason_code, trade.note,
                 ],
             )?;
             Ok(())
@@ -485,6 +542,30 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             realized_pnl_usdc       REAL,
             reason_code             TEXT NOT NULL,
             note                    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS weather_ladder_trades (
+            id                  INTEGER PRIMARY KEY,
+            ts                  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            strategy_id         TEXT NOT NULL,
+            ladder_id           TEXT NOT NULL,
+            market_slug         TEXT NOT NULL,
+            city                TEXT NOT NULL,
+            target_date         TEXT NOT NULL,
+            action              TEXT NOT NULL,
+            leg_index           INTEGER NOT NULL DEFAULT 0,
+            price               REAL NOT NULL,
+            size_usdc           REAL NOT NULL,
+            p_yes               REAL,
+            lead_days           INTEGER,
+            ladder_legs         INTEGER NOT NULL DEFAULT 0,
+            ladder_sum_price    REAL NOT NULL DEFAULT 0,
+            ladder_payout_ratio REAL NOT NULL DEFAULT 0,
+            ladder_combined_p   REAL NOT NULL DEFAULT 0,
+            realized_pnl_usdc   REAL,
+            model               TEXT NOT NULL DEFAULT 'gfs',
+            reason_code         TEXT NOT NULL,
+            note                TEXT
         );
 
         CREATE TABLE IF NOT EXISTS strategy_versions (

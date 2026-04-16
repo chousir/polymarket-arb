@@ -216,6 +216,14 @@ mod tests {
             forecast_shift_threshold: 0.15,
             consensus_max_divergence: 0.10,
             loop_interval_sec: 60,
+            ladder_min_leg_price: 0.0002,
+            ladder_max_leg_price: 0.15,
+            ladder_min_payout_ratio: 80.0,
+            ladder_min_combined_p_yes: 0.20,
+            ladder_min_legs: 3,
+            ladder_max_legs: 7,
+            ladder_max_total_usdc: 5.0,
+            ladder_catastrophic_shift_threshold: 0.35,
         }
     }
 

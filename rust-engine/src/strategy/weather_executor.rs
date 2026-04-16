@@ -75,12 +75,17 @@ struct WeatherPosition {
     entry_price: f64,
     entry_ts: i64,
     size_usdc: f64,
-    /// Exit when held token bid ≥ this value
-    take_profit_price: f64,
+    /// Minimum profit required to activate trailing TP (fees + half edge)
+    profit_target: f64,
+    /// Highest bid seen while holding — trailing TP floor = bid_best - profit_target
+    bid_best: f64,
     /// Exit when held token ask ≤ this value
     stop_loss_price: f64,
     /// Model probability of YES at the time of entry (for FORECAST_SHIFT detection)
     p_yes_at_entry: f64,
+    /// Best model p_yes seen while holding: max for YES positions, min for NO positions.
+    /// Used as trailing baseline — exit when p_yes retreats `forecast_shift_threshold` from best.
+    p_yes_best: f64,
     /// GFS / ECMWF / Ensemble / Consensus
     model: WeatherModel,
     /// Days from today to target date at the time of entry
@@ -121,9 +126,24 @@ impl WeatherStrategy {
     /// Continuous 15-minute loop.  Runs forever inside `tokio::spawn`.
     pub async fn run_loop(&self, db: &DbWriter) {
         let loop_interval_sec = self.sc.loop_interval_sec.max(MIN_LOOP_INTERVAL_SEC);
+
+        // TIME_DECAY_EXIT and the entry filter both rely on polling, not a
+        // precise timer.  The abort window must exceed the loop interval or the
+        // check will fire *after* the market has already closed.
+        //
+        // Rule: effective window = max(global_setting, loop_interval × 2).
+        // This guarantees at least one full loop iteration of headroom.
+        // The global floor (default 30 s) still applies to timer-based
+        // strategies (dump_hedge, pure_arb) that never call this path.
+        let effective_abort_sec = self
+            .global
+            .abort_before_close_sec
+            .max(loop_interval_sec * 2);
+
         tracing::info!(
             "[Weather:{}] 啟動掃描循環  model={}  min_edge={:.0}bps  max_spread={:.4}  \
-             confidence={:.2}  lead={}–{}d  cities=[{}]  shift_thr={:.2}  interval={}s",
+             confidence={:.2}  lead={}–{}d  cities=[{}]  shift_thr={:.2}  interval={}s  \
+             abort_before_close={}s",
             self.sc.id,
             self.forecast_model,
             self.sc.min_net_edge_bps,
@@ -138,9 +158,14 @@ impl WeatherStrategy {
             },
             self.sc.forecast_shift_threshold,
             loop_interval_sec,
+            effective_abort_sec,
         );
 
         let mut open_positions: Vec<WeatherPosition> = Vec::new();
+        // Slugs that were exited this run-session.  Prevents re-entering the
+        // same market after a TIME_DECAY_EXIT / STOP_LOSS / etc. death-loop.
+        // Cleared on engine restart (process restart = fresh session).
+        let mut exited_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut interval = tokio::time::interval(Duration::from_secs(loop_interval_sec));
 
         loop {
@@ -160,10 +185,10 @@ impl WeatherStrategy {
             }
 
             // ── 1. Monitor existing positions ──────────────────────────────────
-            self.monitor_positions(&mut open_positions, db).await;
+            self.monitor_positions(&mut open_positions, db, effective_abort_sec, &mut exited_slugs).await;
 
             // ── 2. Scan for new entries ────────────────────────────────────────
-            match self.scan_for_entries(&open_positions, db).await {
+            match self.scan_for_entries(&open_positions, db, effective_abort_sec, &exited_slugs).await {
                 Ok(new_pos) => {
                     if !new_pos.is_empty() {
                         tracing::info!(
@@ -184,9 +209,11 @@ impl WeatherStrategy {
 
     // ── Monitor open positions ────────────────────────────────────────────────
 
-    async fn monitor_positions(&self, positions: &mut Vec<WeatherPosition>, db: &DbWriter) {
+    async fn monitor_positions(&self, positions: &mut Vec<WeatherPosition>, db: &DbWriter, effective_abort_sec: u64, exited_slugs: &mut std::collections::HashSet<String>) {
         let now_ts = Utc::now().timestamp() as u64;
         let mut to_remove: Vec<usize> = Vec::new();
+        // Slugs confirmed exited this iteration — drained into exited_slugs after loop.
+        let mut newly_exited: Vec<String> = Vec::new();
 
         // Prefetch fresh forecasts for each unique city in open positions
         // (one HTTP call per city, then re-used for all positions in that city)
@@ -203,10 +230,10 @@ impl WeatherStrategy {
             None
         };
 
-        for (idx, pos) in positions.iter().enumerate() {
+        for (idx, pos) in positions.iter_mut().enumerate() {
             // ── TIME_DECAY_EXIT: market is about to close ─────────────────────
             let secs_to_close = pos.market.close_ts.saturating_sub(now_ts);
-            if secs_to_close < self.global.abort_before_close_sec {
+            if secs_to_close < effective_abort_sec {
                 let hold_sec = now_ts as i64 - pos.entry_ts;
                 let realized_pnl = -self.global.compute_fee(pos.size_usdc);
                 tracing::info!(
@@ -221,6 +248,7 @@ impl WeatherStrategy {
                     self.capital.lock().expect("capital mutex poisoned")
                         .on_cycle_end(Some(pos.entry_price), None, pos.size_usdc,
                                       self.global.compute_fee(pos.size_usdc));
+                    newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
                     continue;
                 }
@@ -242,6 +270,7 @@ impl WeatherStrategy {
                         self.capital.lock().expect("capital mutex poisoned")
                             .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                           self.global.compute_fee(pos.size_usdc));
+                        newly_exited.push(pos.market_slug.clone());
                         to_remove.push(idx);
                     }
                     Err(e) => {
@@ -266,17 +295,28 @@ impl WeatherStrategy {
                 }
             };
 
-            // ── TAKE_PROFIT: bid reached the target ────────────────────────────
-            if book.best_bid >= pos.take_profit_price {
+            // ── TAKE_PROFIT: trailing high-watermark mechanism ─────────────────
+            // Update bid_best (only moves up).
+            pos.bid_best = pos.bid_best.max(book.best_bid);
+            // Adaptive trailing gap: shrinks as bid_best approaches 100¢ so the
+            // floor tightens near resolution (prevents giving back large gains).
+            // Formula: min(profit_target, (1 - bid_best) * 2), floor at 2¢.
+            let effective_gap = pos.profit_target
+                .min((1.0 - pos.bid_best) * 2.0)
+                .max(0.02);
+            let trailing_floor = pos.bid_best - effective_gap;
+            if pos.bid_best >= pos.entry_price + pos.profit_target
+                && book.best_bid < trailing_floor
+            {
                 let hold_sec = now_ts as i64 - pos.entry_ts;
                 let exit_price = book.best_bid;
                 let realized_pnl = (exit_price - pos.entry_price) * pos.size_usdc
                     - self.global.compute_fee(pos.size_usdc) * 2.0;
                 tracing::info!(
-                    "[Weather:{}] TAKE_PROFIT {} side={} bid={:.4} tp={:.4}  \
+                    "[Weather:{}] TAKE_PROFIT {} side={} bid={:.4} trailing_floor={:.4}  \
                      hold={}s  pnl={:.4}",
                     self.sc.id, pos.market_slug, pos.side,
-                    book.best_bid, pos.take_profit_price, hold_sec, realized_pnl
+                    book.best_bid, trailing_floor, hold_sec, realized_pnl
                 );
                 if self.global.is_dry_run() {
                     self.write_exit(
@@ -293,21 +333,30 @@ impl WeatherStrategy {
                 self.capital.lock().expect("capital mutex poisoned")
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
+                newly_exited.push(pos.market_slug.clone());
                 to_remove.push(idx);
                 continue;
             }
 
-            // ── STOP_LOSS: ask fell below the floor ────────────────────────────
-            if book.best_ask <= pos.stop_loss_price {
+            // ── STOP_LOSS: trailing floor follows bid_best upward ──────────────
+            // effective_sl = max(entry - delta, bid_best - delta)
+            // Once bid_best > entry the floor rises, locking in gains progressively.
+            let sl_delta = if pos.lead_days >= 1 {
+                self.sc.stop_loss_delta * 2.0
+            } else {
+                self.sc.stop_loss_delta
+            };
+            let effective_sl = pos.stop_loss_price.max(pos.bid_best - sl_delta);
+            if book.best_ask <= effective_sl {
                 let hold_sec = now_ts as i64 - pos.entry_ts;
                 let exit_price = book.best_bid;
                 let realized_pnl = (exit_price - pos.entry_price) * pos.size_usdc
                     - self.global.compute_fee(pos.size_usdc) * 2.0;
                 tracing::info!(
-                    "[Weather:{}] STOP_LOSS {} side={} ask={:.4} floor={:.4}  \
+                    "[Weather:{}] STOP_LOSS {} side={} ask={:.4} floor={:.4} bid_best={:.4}  \
                      hold={}s  pnl={:.4}",
                     self.sc.id, pos.market_slug, pos.side,
-                    book.best_ask, pos.stop_loss_price, hold_sec, realized_pnl
+                    book.best_ask, effective_sl, pos.bid_best, hold_sec, realized_pnl
                 );
                 if self.global.is_dry_run() {
                     self.write_exit(
@@ -324,6 +373,7 @@ impl WeatherStrategy {
                 self.capital.lock().expect("capital mutex poisoned")
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
+                newly_exited.push(pos.market_slug.clone());
                 to_remove.push(idx);
                 continue;
             }
@@ -361,13 +411,50 @@ impl WeatherStrategy {
             };
 
             if let Some(signal) = signal_opt {
+                // Guard: model probability of the held side collapsed to ~0 while the
+                // market still prices it above 10¢ — almost always a transient API glitch
+                // or inter-run gap rather than a genuine signal flip.
+                // Skip FORECAST_SHIFT and do NOT update the trailing-best baseline.
+                let held_model_p = match pos.side.as_str() {
+                    "YES" => signal.p_yes,
+                    "NO"  => 1.0 - signal.p_yes,
+                    _     => signal.p_yes,
+                };
+                if held_model_p < 0.02 && book.best_ask > 0.10 {
+                    tracing::debug!(
+                        "[Weather:{}] {} FORECAST_SHIFT 跳過：model_p={:.3} 疑似異常 \
+                         (市場 ask={:.3} 仍有定價，不更新 trailing-best)",
+                        self.sc.id, pos.market_slug, held_model_p, book.best_ask
+                    );
+                    continue;
+                }
+
                 let direction_flipped = match pos.side.as_str() {
                     "YES" => signal.direction == WeatherDirection::BuyNo,
                     "NO"  => signal.direction == WeatherDirection::BuyYes,
                     _     => false,
                 };
-                let p_yes_shifted = (signal.p_yes - pos.p_yes_at_entry).abs()
-                    >= self.sc.forecast_shift_threshold;
+                // Update trailing best: track the most favourable p_yes seen while holding.
+                // For YES positions we want the peak; for NO positions we want the trough.
+                match pos.side.as_str() {
+                    "YES" => pos.p_yes_best = pos.p_yes_best.max(signal.p_yes),
+                    "NO"  => pos.p_yes_best = pos.p_yes_best.min(signal.p_yes),
+                    _     => {}
+                }
+
+                // Exit only when model retreats `threshold` from the trailing best.
+                // lead_days ≥ 1: overnight forecast updates introduce 0.10–0.15 normal noise,
+                // so double the threshold to require a genuine signal shift (not just noise).
+                let effective_shift_threshold = if pos.lead_days >= 1 {
+                    self.sc.forecast_shift_threshold * 2.0
+                } else {
+                    self.sc.forecast_shift_threshold
+                };
+                let p_yes_shifted = match pos.side.as_str() {
+                    "YES" => pos.p_yes_best - signal.p_yes >= effective_shift_threshold,
+                    "NO"  => signal.p_yes - pos.p_yes_best >= effective_shift_threshold,
+                    _     => false,
+                };
 
                 if direction_flipped || p_yes_shifted {
                     let hold_sec = now_ts as i64 - pos.entry_ts;
@@ -399,6 +486,7 @@ impl WeatherStrategy {
                     self.capital.lock().expect("capital mutex poisoned")
                         .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                       self.global.compute_fee(pos.size_usdc));
+                    newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
                     continue;
                 }
@@ -409,6 +497,12 @@ impl WeatherStrategy {
         for idx in to_remove.into_iter().rev() {
             positions.swap_remove(idx);
         }
+        // Blacklist all slugs that were exited this iteration so we don't
+        // immediately re-enter them on the next loop tick.
+        for slug in newly_exited {
+            tracing::debug!("[Weather:{}] 冷卻封鎖: {slug}", self.sc.id);
+            exited_slugs.insert(slug);
+        }
     }
 
     // ── Scan for new entries ──────────────────────────────────────────────────
@@ -417,6 +511,8 @@ impl WeatherStrategy {
         &self,
         existing: &[WeatherPosition],
         db: &DbWriter,
+        effective_abort_sec: u64,
+        exited_slugs: &std::collections::HashSet<String>,
     ) -> Result<Vec<WeatherPosition>, AppError> {
         let now_ts = Utc::now().timestamp() as u64;
 
@@ -439,7 +535,7 @@ impl WeatherStrategy {
             min_lead_days:           self.sc.weather_min_lead_days,
             max_lead_days:           self.sc.weather_max_lead_days,
             min_depth_usdc:          self.sc.weather_min_depth_usdc,
-            abort_before_close_sec:  self.global.abort_before_close_sec,
+            abort_before_close_sec:  effective_abort_sec,
             ..WeatherFilterConfig::default()
         };
 
@@ -451,6 +547,16 @@ impl WeatherStrategy {
         let mut by_city: HashMap<String, Vec<WeatherMarket>> = HashMap::new();
         for market in &markets {
             if open_slugs.contains(market.slug.as_str()) {
+                continue;
+            }
+            // Skip markets that were exited this session — prevents death-loops
+            // where TD_EXIT fires, position is removed, then immediately re-entered
+            // on the next tick for the same market.
+            if exited_slugs.contains(&market.slug) {
+                tracing::debug!(
+                    "[Weather:{}] {} 本次已平倉，跳過重入",
+                    self.sc.id, market.slug
+                );
                 continue;
             }
             if self.forecast_model == WeatherModel::MetarShort {
@@ -757,7 +863,14 @@ impl WeatherStrategy {
                     + self.sc.min_net_edge_bps * 0.5)
                     / 10_000.0;
                 let take_profit_price = entry_best_ask + profit_target;
-                let stop_loss_price   = entry_best_ask - self.sc.stop_loss_delta;
+                // Positions entered ≥1 day before resolution experience overnight forecast
+                // updates and thin liquidity — use 2× stop_loss_delta to avoid premature exits.
+                let effective_stop_loss_delta = if lead_days >= 1 {
+                    self.sc.stop_loss_delta * 2.0
+                } else {
+                    self.sc.stop_loss_delta
+                };
+                let stop_loss_price = entry_best_ask - effective_stop_loss_delta;
 
                 if self.global.is_dry_run() {
                     let _ = db.write_weather_dry_run_trade(&WeatherDryRunTrade {
@@ -794,10 +907,11 @@ impl WeatherStrategy {
 
                     tracing::info!(
                         "[Weather:{}] [DRY_RUN] ENTRY {} {} @ {:.4}  \
-                         edge={:.0}bps  size={:.2} USDC  TP={:.4}  SL={:.4}  \
+                         edge={:.0}bps  size={:.2} USDC  TP_target={:.4}  SL={:.4}  \
                          p_yes={:.3}  model={}",
                         self.sc.id, side, market.slug, entry_best_ask,
-                        signal.edge_bps, bet_size, take_profit_price, stop_loss_price,
+                        signal.edge_bps, bet_size,
+                        entry_best_ask + profit_target, stop_loss_price,
                         signal.p_yes, model_used,
                     );
                 } else {
@@ -840,9 +954,11 @@ impl WeatherStrategy {
                     entry_price:          entry_best_ask,
                     entry_ts:             Utc::now().timestamp(),
                     size_usdc:            bet_size,
-                    take_profit_price,
+                    profit_target,
+                    bid_best:             entry_best_ask,
                     stop_loss_price,
                     p_yes_at_entry:       signal.p_yes,
+                    p_yes_best:           signal.p_yes,
                     model:                model_used,
                     lead_days,
                     expected_net_edge_bps: signal.edge_bps,
@@ -939,18 +1055,30 @@ impl WeatherStrategy {
             cap.current_bet_size()
         };
         WeatherDecisionConfig {
-            taker_fee_bps:        self.sc.taker_fee_bps,
-            slippage_buffer_bps:  self.sc.slippage_buffer_bps,
-            min_net_edge_bps:     self.sc.min_net_edge_bps,
-            min_model_confidence: self.sc.min_model_confidence,
-            max_spread:           self.sc.max_spread,
+            taker_fee_bps:                  self.sc.taker_fee_bps,
+            slippage_buffer_bps:            self.sc.slippage_buffer_bps,
+            min_net_edge_bps:               self.sc.min_net_edge_bps,
+            min_model_confidence:           self.sc.min_model_confidence,
+            min_model_confidence_temprange: self.sc.min_model_confidence_temprange,
+            min_temprange_p_yes:            self.sc.min_temprange_p_yes,
+            min_ensemble_members:           self.sc.min_ensemble_members,
+            max_spread:                     self.sc.max_spread,
             min_depth_usdc,
-            bet_size_usdc:        bet_size,
+            bet_size_usdc:                  bet_size,
         }
     }
 }
 
 // ── Module-level helpers ──────────────────────────────────────────────────────
+
+/// Fetch forecasts for a single city using the given model.
+/// Returns `None` if the city is unknown or the fetch fails.
+pub async fn fetch_city_forecast_single(
+    info: &crate::api::weather::CityInfo,
+    model: WeatherModel,
+) -> Option<Vec<WeatherForecast>> {
+    fetch_city_forecast_cached(info.name, model).await
+}
 
 /// Fetch forecasts for a set of city names using the configured model,
 /// returning a map of city → Vec<WeatherForecast>.  Cities not found in
@@ -1078,16 +1206,17 @@ fn evaluate_consensus_signal_for_market(
     max_divergence: f64,
 ) -> Option<WeatherSignal> {
     // GFS is required; ECMWF and Ensemble are optional (degraded consensus).
+    let min_ens = cfg.min_ensemble_members;
     let gfs_fc = find_forecast_for_date(&city_fc.gfs, market.target_date)?;
-    let p_gfs  = weather_decision::probability_yes(gfs_fc, market)?;
+    let p_gfs  = weather_decision::probability_yes(gfs_fc, market, min_ens)?;
 
     let p_ecmwf = city_fc.ecmwf.as_ref()
         .and_then(|v| find_forecast_for_date(v, market.target_date))
-        .and_then(|fc| weather_decision::probability_yes(fc, market));
+        .and_then(|fc| weather_decision::probability_yes(fc, market, min_ens));
 
     let p_ens = city_fc.ensemble.as_ref()
         .and_then(|v| find_forecast_for_date(v, market.target_date))
-        .and_then(|fc| weather_decision::probability_yes(fc, market));
+        .and_then(|fc| weather_decision::probability_yes(fc, market, min_ens));
 
     // Build list of available probabilities (GFS always present)
     let mut p_values: Vec<f64> = vec![p_gfs];
@@ -1151,28 +1280,29 @@ fn evaluate_consensus_signal_for_market(
         });
     }
 
-    if p_yes > (1.0 - cfg.min_model_confidence) && p_yes < cfg.min_model_confidence {
-        return Some(WeatherSignal {
-            direction: WeatherDirection::Hold,
-            edge_bps: 0.0,
-            p_yes,
-            entry_price: 0.0,
-            reason: format!(
-                "consensus p_yes={:.3} between [{:.3},{:.3}]",
-                p_yes,
-                1.0 - cfg.min_model_confidence,
-                cfg.min_model_confidence,
-            ),
-            reason_code: "LOW_CONFIDENCE".to_string(),
-        });
-    }
-
     let cost_frac = (cfg.taker_fee_bps + cfg.slippage_buffer_bps) / 10_000.0;
     let min_edge = cfg.min_net_edge_bps / 10_000.0;
     let edge_yes = p_yes - snapshot.yes_best_ask - cost_frac * 2.0;
     let edge_no = (1.0 - p_yes) - snapshot.no_best_ask - cost_frac * 2.0;
 
+    let is_temprange = market.market_type == crate::api::weather_market::WeatherMarketType::TempRange;
+
     if edge_yes >= min_edge && edge_yes >= edge_no {
+        let min_conf = if is_temprange { cfg.min_temprange_p_yes } else { cfg.min_model_confidence };
+        if p_yes < min_conf {
+            return Some(WeatherSignal {
+                direction: WeatherDirection::Hold,
+                edge_bps: 0.0,
+                p_yes,
+                entry_price: 0.0,
+                reason: format!(
+                    "consensus BUY_YES blocked: p_yes={:.3} < min={:.3} ({})",
+                    p_yes, min_conf,
+                    if is_temprange { "temprange" } else { "extreme" }
+                ),
+                reason_code: "LOW_CONFIDENCE".to_string(),
+            });
+        }
         Some(WeatherSignal {
             direction: WeatherDirection::BuyYes,
             edge_bps: edge_yes * 10_000.0,
@@ -1185,6 +1315,21 @@ fn evaluate_consensus_signal_for_market(
             reason_code: "BUY_YES".to_string(),
         })
     } else if edge_no >= min_edge {
+        let min_conf_no = if is_temprange { cfg.min_model_confidence_temprange } else { cfg.min_model_confidence };
+        if (1.0 - p_yes) < min_conf_no {
+            return Some(WeatherSignal {
+                direction: WeatherDirection::Hold,
+                edge_bps: 0.0,
+                p_yes,
+                entry_price: 0.0,
+                reason: format!(
+                    "consensus BUY_NO blocked: (1-p_yes)={:.3} < min={:.3} ({})",
+                    1.0 - p_yes, min_conf_no,
+                    if is_temprange { "temprange" } else { "extreme" }
+                ),
+                reason_code: "LOW_CONFIDENCE".to_string(),
+            });
+        }
         Some(WeatherSignal {
             direction: WeatherDirection::BuyNo,
             edge_bps: edge_no * 10_000.0,
@@ -1435,6 +1580,16 @@ mod tests {
             forecast_shift_threshold: 0.15,
             consensus_max_divergence: 0.10,
             loop_interval_sec: 900,
+            ladder_min_leg_price: 0.0002,
+            ladder_max_leg_price: 0.15,
+            ladder_min_payout_ratio: 80.0,
+            ladder_min_combined_p_yes: 0.20,
+            ladder_min_legs: 3,
+            ladder_max_legs: 7,
+            ladder_max_total_usdc: 5.0,
+            ladder_catastrophic_shift_threshold: 0.35,
+            min_model_confidence_temprange: 0.60,
+            min_temprange_p_yes: 0.28,
         }
     }
 
@@ -1482,6 +1637,7 @@ mod tests {
             token_id_yes: "tok_yes".to_string(),
             token_id_no: "tok_no".to_string(),
             close_ts: now_ts + 3600,
+            liquidity_clob: 100.0,
         };
 
         WeatherPosition {
@@ -1493,9 +1649,11 @@ mod tests {
             entry_price: 0.45,
             entry_ts: Utc::now().timestamp() - 300,
             size_usdc: 10.0,
-            take_profit_price: 0.55,
+            profit_target: 0.10,
+            bid_best: 0.45,
             stop_loss_price: 0.35,
             p_yes_at_entry: 0.70,
+            p_yes_best:     0.70,
             model: WeatherModel::Gfs,
             lead_days: 1,
             expected_net_edge_bps: 120.0,
@@ -1540,7 +1698,7 @@ mod tests {
         })));
         set_mock_submit_order_outcome(Some(MockSubmitOrderOutcome::Success));
 
-        strategy.monitor_positions(&mut positions, &db).await;
+        strategy.monitor_positions(&mut positions, &db, 30, &mut Default::default()).await;
 
         assert!(positions.is_empty(), "successful live close should remove position");
 
@@ -1574,7 +1732,7 @@ mod tests {
             "simulated failure".to_string(),
         )));
 
-        strategy.monitor_positions(&mut positions, &db).await;
+        strategy.monitor_positions(&mut positions, &db, 30, &mut Default::default()).await;
 
         assert_eq!(positions.len(), 1, "failed live close should keep position");
 

@@ -1,6 +1,6 @@
 .env
 *.env.local
-.env.docker
+# .env.docker 是給使用者 cp 的模板，需要 commit 進 repo，不在此排除
 **/data/*.db
 **/data/*.db-shm
 **/data/*.db-wal

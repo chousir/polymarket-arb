@@ -294,6 +294,32 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
+    // ── 11c. Spawn WeatherLadder strategies as independent background tasks ────
+    {
+        let ladder_strategies: Vec<_> = config
+            .strategies
+            .iter()
+            .filter(|s| s.enabled && s.strategy_type == StrategyType::WeatherLadder)
+            .collect();
+
+        for sc in ladder_strategies {
+            let global = config.clone();
+            let sc = sc.clone();
+            let cap = capitals
+                .get(&sc.id)
+                .map(Arc::clone)
+                .expect("capital tracker missing for weather ladder strategy");
+            let db = db.clone();
+
+            tracing::info!("[Ladder:{}] 啟動背景掃描任務", sc.id);
+            tokio::spawn(async move {
+                strategy::weather_ladder_executor::WeatherLadderStrategy::new(global, sc, cap)
+                    .run_loop(&db)
+                    .await;
+            });
+        }
+    }
+
     // ── 12. Main cycle loop (BTC strategies only) ─────────────────────────────
     tracing::info!("[Main] 進入主循環");
     if let Some(t) = &telegram {
@@ -358,7 +384,7 @@ async fn main() -> Result<(), AppError> {
         }
 
         // ── Subscribe + build combined feed, then fan out ─────────────────────
-        // Exclude Mention and Weather strategies — they run in their own background tasks.
+        // Exclude Mention, Weather, WeatherLadder — they run in their own background tasks.
         let active: Vec<(StrategyConfig, SharedCapital)> = config
             .strategies
             .iter()
@@ -366,6 +392,7 @@ async fn main() -> Result<(), AppError> {
                 s.enabled
                     && s.strategy_type != StrategyType::Mention
                     && s.strategy_type != StrategyType::Weather
+                    && s.strategy_type != StrategyType::WeatherLadder
             })
             .filter_map(|s| {
                 capitals.get(&s.id).map(|cap| (s.clone(), Arc::clone(cap)))
@@ -400,10 +427,12 @@ async fn main() -> Result<(), AppError> {
                                 .run_market_cycle(&info, &db, rx)
                                 .await
                         }
-                        // Mention and Weather strategies are spawned as persistent
+                        // Mention, Weather, WeatherLadder are spawned as persistent
                         // background tasks above and never reach this BTC cycle fanout.
-                        StrategyType::Mention | StrategyType::Weather => unreachable!(
-                            "Mention/Weather strategy should not appear in BTC cycle fanout"
+                        StrategyType::Mention
+                        | StrategyType::Weather
+                        | StrategyType::WeatherLadder => unreachable!(
+                            "Mention/Weather/WeatherLadder strategy should not appear in BTC cycle fanout"
                         ),
                     }
                 })
