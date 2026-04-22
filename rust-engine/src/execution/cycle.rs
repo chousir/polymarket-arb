@@ -141,7 +141,7 @@ impl TradeCycle {
                 if dump_pct >= sc.dump_threshold_pct {
                     // ── Check drawdown stop ───────────────────────────────────
                     {
-                        let cap = self.capital.lock().expect("capital mutex poisoned");
+                        let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                         if cap.is_stopped() {
                             tracing::warn!(
                                 "[Cycle:{}] ⛔ 停損觸發，跳過 Leg1  drawdown={:.1}%",
@@ -155,7 +155,7 @@ impl TradeCycle {
                     let bet_size = self
                         .capital
                         .lock()
-                        .expect("capital mutex poisoned")
+                        .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                         .current_bet_size();
                     let fee_usdc = executor.config.compute_fee(bet_size);
 
@@ -208,7 +208,7 @@ impl TradeCycle {
                 if signal::is_hedge_condition(snapshot, sc.hedge_threshold_sum) {
                     // ── Check drawdown stop ───────────────────────────────────
                     {
-                        let cap = self.capital.lock().expect("capital mutex poisoned");
+                        let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                         if cap.is_stopped() {
                             tracing::warn!(
                                 "[Cycle:{}] ⛔ 停損觸發，跳過 Leg2  drawdown={:.1}%",
@@ -222,7 +222,7 @@ impl TradeCycle {
                     let bet_size = self
                         .capital
                         .lock()
-                        .expect("capital mutex poisoned")
+                        .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                         .current_bet_size();
                     let fee_usdc = executor.config.compute_fee(bet_size);
 

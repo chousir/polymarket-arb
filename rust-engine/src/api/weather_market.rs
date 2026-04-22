@@ -46,8 +46,9 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // connect_timeout guards the TCP+TLS handshake only.
         .connect_timeout(Duration::from_secs(10))
         // timeout covers the full request lifecycle including body download.
-        // Gamma API returns ~4-5 MB; allow up to 90s for slow connections.
-        .timeout(Duration::from_secs(90))
+        // 15s is sufficient for ~5 MB on a reasonable connection; a longer
+        // timeout would delay the next monitor_positions() cycle unnecessarily.
+        .timeout(Duration::from_secs(15))
         .user_agent("polymarket-arb/1.0")
         .build()
         .expect("build weather_market client")
@@ -120,7 +121,7 @@ pub struct WeatherMarket {
 pub async fn fetch_weather_markets() -> Result<Vec<WeatherMarket>, AppError> {
     // ── Cache read ────────────────────────────────────────────────────────────
     {
-        let cache = MARKET_CACHE.lock().unwrap();
+        let cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] weather market cache: {e}"); e.into_inner() });
         if let Some((fetched_at, ref markets)) = *cache {
             if fetched_at.elapsed() < CACHE_TTL {
                 tracing::debug!("[WeatherMkt] cache hit ({} markets)", markets.len());
@@ -135,7 +136,7 @@ pub async fn fetch_weather_markets() -> Result<Vec<WeatherMarket>, AppError> {
 
     // Double-check cache after waiting for in-flight fetch to complete.
     {
-        let cache = MARKET_CACHE.lock().unwrap();
+        let cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] weather market cache: {e}"); e.into_inner() });
         if let Some((fetched_at, ref markets)) = *cache {
             if fetched_at.elapsed() < CACHE_TTL {
                 tracing::debug!(
@@ -157,7 +158,21 @@ pub async fn fetch_weather_markets() -> Result<Vec<WeatherMarket>, AppError> {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[WeatherMkt] page={page} offset={offset} 失敗: {e}");
-                break;
+                // Fall back to stale cache rather than blocking entry scanning.
+                let cache = MARKET_CACHE.lock().unwrap_or_else(|err| {
+                    tracing::error!("[Mutex Poisoned] weather market cache: {err}");
+                    err.into_inner()
+                });
+                if let Some((_, ref markets)) = *cache {
+                    tracing::warn!(
+                        "[WeatherMkt] Gamma 不可用，使用 stale cache ({} markets)",
+                        markets.len()
+                    );
+                    return Ok(markets.clone());
+                }
+                return Err(AppError::ApiError(format!(
+                    "weather market pagination failed at page {page}: {e}"
+                )));
             }
         };
 
@@ -186,7 +201,7 @@ pub async fn fetch_weather_markets() -> Result<Vec<WeatherMarket>, AppError> {
 
     // ── Cache write ───────────────────────────────────────────────────────────
     {
-        let mut cache = MARKET_CACHE.lock().unwrap();
+        let mut cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] weather market cache: {e}"); e.into_inner() });
         *cache = Some((Instant::now(), all_markets.clone()));
     }
 

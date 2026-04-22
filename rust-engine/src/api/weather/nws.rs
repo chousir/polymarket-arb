@@ -30,8 +30,11 @@ use std::sync::Mutex;
 
 use crate::api::weather::{CityInfo, WeatherForecast, WeatherModel};
 use crate::error::AppError;
+use crate::rate_limit::token_bucket::backoff;
 
 const NWS_BASE: &str = "https://api.weather.gov";
+const RETRY_ATTEMPTS: u32 = 3;
+const RETRY_BASE_MS: u64 = 1_000;
 /// NWS API requires a descriptive User-Agent.
 const USER_AGENT: &str = "polymarket-arb/1.0 (contact@example.com)";
 
@@ -99,7 +102,7 @@ pub async fn fetch_nws_hourly_agg(
 async fn resolve_forecast_url(city: &CityInfo) -> Result<String, AppError> {
     // Check cache first
     {
-        let cache = GRID_CACHE.lock().unwrap();
+        let cache = GRID_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] NWS grid cache: {e}"); e.into_inner() });
         if let Some(meta) = cache.get(city.icao) {
             tracing::debug!("[NWS] grid cache hit for {}", city.name);
             return Ok(meta.forecast_url.clone());
@@ -107,7 +110,7 @@ async fn resolve_forecast_url(city: &CityInfo) -> Result<String, AppError> {
     }
 
     let _ = resolve_grid_meta(city).await?;
-    let cache = GRID_CACHE.lock().unwrap();
+    let cache = GRID_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] NWS grid cache: {e}"); e.into_inner() });
     if let Some(meta) = cache.get(city.icao) {
         return Ok(meta.forecast_url.clone());
     }
@@ -120,7 +123,7 @@ async fn resolve_forecast_url(city: &CityInfo) -> Result<String, AppError> {
 
 async fn resolve_forecast_hourly_url(city: &CityInfo) -> Result<String, AppError> {
     {
-        let cache = GRID_CACHE.lock().unwrap();
+        let cache = GRID_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] NWS grid cache: {e}"); e.into_inner() });
         if let Some(meta) = cache.get(city.icao) {
             tracing::debug!("[NWS] hourly grid cache hit for {}", city.name);
             return Ok(meta.forecast_hourly_url.clone());
@@ -128,7 +131,7 @@ async fn resolve_forecast_hourly_url(city: &CityInfo) -> Result<String, AppError
     }
 
     let _ = resolve_grid_meta(city).await?;
-    let cache = GRID_CACHE.lock().unwrap();
+    let cache = GRID_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] NWS grid cache: {e}"); e.into_inner() });
     if let Some(meta) = cache.get(city.icao) {
         return Ok(meta.forecast_hourly_url.clone());
     }
@@ -173,7 +176,7 @@ async fn resolve_grid_meta(city: &CityInfo) -> Result<GridMeta, AppError> {
     };
 
     {
-        let mut cache = GRID_CACHE.lock().unwrap();
+        let mut cache = GRID_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] NWS grid cache: {e}"); e.into_inner() });
         cache.insert(city.icao.to_string(), meta.clone());
     }
 
@@ -185,18 +188,36 @@ async fn resolve_grid_meta(city: &CityInfo) -> Result<GridMeta, AppError> {
 async fn fetch_periods(url: &str) -> Result<Vec<Period>, AppError> {
     tracing::debug!("[NWS] GET {url}");
 
-    let resp: ForecastResponse = CLIENT
-        .get(url)
-        .send()
-        .await
-        .map_err(AppError::Http)?
-        .error_for_status()
-        .map_err(AppError::Http)?
-        .json()
-        .await
-        .map_err(AppError::Http)?;
-
-    Ok(resp.properties.periods)
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt - 1, RETRY_BASE_MS).await;
+        }
+        let result = async {
+            CLIENT
+                .get(url)
+                .send()
+                .await
+                .map_err(AppError::Http)?
+                .error_for_status()
+                .map_err(AppError::Http)?
+                .json::<ForecastResponse>()
+                .await
+                .map_err(AppError::Http)
+        }
+        .await;
+        match result {
+            Ok(resp) => return Ok(resp.properties.periods),
+            Err(e) => {
+                tracing::warn!(
+                    "[NWS] periods fetch 失敗 ({}/{}): {e}",
+                    attempt + 1, RETRY_ATTEMPTS
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ApiError("NWS periods retry exhausted".to_string())))
 }
 
 // ── Parse periods into WeatherForecast ────────────────────────────────────────
@@ -231,7 +252,7 @@ pub(crate) fn parse_nws_periods(
     for p in periods {
         // startTime format: "2026-06-15T06:00:00-04:00"
         let date = parse_nws_date(&p.start_time)?;
-        let temp_c = f_to_c(p.temperature as f64, &p.temperature_unit);
+        let temp_c = f_to_c(p.temperature as f64, &p.temperature_unit)?;
         let precip_pct = p.probability_of_precipitation
             .as_ref()
             .and_then(|v| v.value)
@@ -305,7 +326,7 @@ pub(crate) fn parse_nws_hourly_periods(
 
     for p in periods {
         let date = parse_nws_date(&p.start_time)?;
-        let temp_c = f_to_c(p.temperature as f64, &p.temperature_unit);
+        let temp_c = f_to_c(p.temperature as f64, &p.temperature_unit)?;
         let precip_pct = p
             .probability_of_precipitation
             .as_ref()
@@ -360,11 +381,15 @@ pub(crate) fn parse_nws_hourly_periods(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn f_to_c(temp_f: f64, unit: &str) -> f64 {
+fn f_to_c(temp_f: f64, unit: &str) -> Result<f64, AppError> {
     if unit.eq_ignore_ascii_case("F") {
-        (temp_f - 32.0) * 5.0 / 9.0
+        Ok((temp_f - 32.0) * 5.0 / 9.0)
+    } else if unit.eq_ignore_ascii_case("C") {
+        Ok(temp_f)
     } else {
-        temp_f // already Celsius
+        Err(AppError::ApiError(format!(
+            "[NWS] unknown temperature unit '{unit}'"
+        )))
     }
 }
 
@@ -456,13 +481,13 @@ mod tests {
         assert_eq!(forecasts.len(), 2);
 
         let f0 = forecasts.iter().find(|f| f.forecast_date.day() == 15).unwrap();
-        assert!((f0.max_temp_c - f_to_c(82.0, "F")).abs() < 0.01);
-        assert!((f0.min_temp_c - f_to_c(65.0, "F")).abs() < 0.01);
+        assert!((f0.max_temp_c - f_to_c(82.0, "F").unwrap()).abs() < 0.01);
+        assert!((f0.min_temp_c - f_to_c(65.0, "F").unwrap()).abs() < 0.01);
         assert!((f0.prob_precip - 0.20).abs() < 1e-9);
 
         let f1 = forecasts.iter().find(|f| f.forecast_date.day() == 16).unwrap();
-        assert!((f1.max_temp_c - f_to_c(90.0, "F")).abs() < 0.01);
-        assert!((f1.min_temp_c - f_to_c(72.0, "F")).abs() < 0.01);
+        assert!((f1.max_temp_c - f_to_c(90.0, "F").unwrap()).abs() < 0.01);
+        assert!((f1.min_temp_c - f_to_c(72.0, "F").unwrap()).abs() < 0.01);
         assert!((f1.prob_precip).abs() < 1e-9); // None → 0
     }
 
@@ -486,11 +511,13 @@ mod tests {
 
     #[test]
     fn f_to_c_conversion() {
-        assert!((f_to_c(32.0, "F") - 0.0).abs()   < 0.01);
-        assert!((f_to_c(212.0, "F") - 100.0).abs() < 0.01);
-        assert!((f_to_c(98.6, "F") - 37.0).abs()  < 0.01);
+        assert!((f_to_c(32.0, "F").unwrap() - 0.0).abs()   < 0.01);
+        assert!((f_to_c(212.0, "F").unwrap() - 100.0).abs() < 0.01);
+        assert!((f_to_c(98.6, "F").unwrap() - 37.0).abs()  < 0.01);
         // Passthrough for Celsius
-        assert!((f_to_c(25.0, "C") - 25.0).abs()  < 0.01);
+        assert!((f_to_c(25.0, "C").unwrap() - 25.0).abs()  < 0.01);
+        // Unknown unit must return Err
+        assert!(f_to_c(25.0, "K").is_err());
     }
 
     #[test]
@@ -525,8 +552,8 @@ mod tests {
         assert_eq!(forecasts.len(), 2);
 
         let f0 = forecasts.iter().find(|f| f.forecast_date.day() == 15).unwrap();
-        assert!((f0.max_temp_c - f_to_c(86.0, "F")).abs() < 0.01);
-        assert!((f0.min_temp_c - f_to_c(64.0, "F")).abs() < 0.01);
+        assert!((f0.max_temp_c - f_to_c(86.0, "F").unwrap()).abs() < 0.01);
+        assert!((f0.min_temp_c - f_to_c(64.0, "F").unwrap()).abs() < 0.01);
         assert!((f0.prob_precip - 0.40).abs() < 1e-9);
     }
 

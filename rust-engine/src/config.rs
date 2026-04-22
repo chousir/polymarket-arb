@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 
 // ── Private TOML-shaped structs (serde deserialize only) ──────────────────────
@@ -98,8 +99,34 @@ struct RawStrategyConfig {
     forecast_shift_threshold: Option<f64>,
     /// Max allowed probability divergence across consensus models (default 0.10)
     consensus_max_divergence: Option<f64>,
+    /// Additive correction applied to model forecast temperature before CDF calculation.
+    /// Set to +2.0 / +3.0 when ECMWF / ensemble runs consistently cold (default 0.0).
+    forecast_temp_bias_celsius: Option<f64>,
+    /// STOP_LOSS tick filter: number of consecutive monitor ticks below the stop floor
+    /// required before the position is exited.  Filters out illiquid-market noise (default 2).
+    min_sl_ticks: Option<u32>,
     /// Per-strategy loop interval in seconds (strategy-specific defaults)
     loop_interval_sec: Option<u64>,
+    // ── WeatherCustomized 專用 ────────────────────────────────────────────
+    /// How many recent polling ticks to use for the lookback slope gate (default 4 ≈ 1 hour).
+    customized_lookback_ticks: Option<u32>,
+    /// Minimum price slope per tick (in direction of trade) required before entry.
+    /// 0.0 = neutral OK; positive = require rising price (default 0.0).
+    customized_min_slope: Option<f64>,
+    /// Minimum ask price for the token we intend to buy (default 0.30).
+    /// Avoids near-decided markets with poor risk/reward.
+    customized_min_entry_price: Option<f64>,
+    /// Maximum ask price for the token we intend to buy (default 0.85).
+    /// Avoids overpriced tokens with thin upside.
+    customized_max_entry_price: Option<f64>,
+    /// Minimum number of history ticks required before the slope gate is active.
+    /// Until this many ticks are recorded the gate is skipped (default 3).
+    customized_min_history_ticks: Option<u32>,
+    /// Maximum allowed ensemble temperature standard deviation (°C).
+    /// High spread = high model uncertainty → skip entry (default 4.0).
+    customized_max_ensemble_spread_celsius: Option<f64>,
+    /// Maximum number of simultaneously open positions per city (default 3).
+    customized_max_positions_per_city: Option<usize>,
     // ── WeatherLadder 專用 ─────────────────────────────────────────────────
     ladder_min_leg_price: Option<f64>,
     ladder_max_leg_price: Option<f64>,
@@ -119,6 +146,9 @@ struct RawSettings {
     risk: RiskSection,
     capital: CapitalSection,
     strategies: Vec<RawStrategyConfig>,
+    /// Per-city seasonal sigma multipliers: city → [spring, summer, autumn, winter]
+    /// spring=Mar-May, summer=Jun-Aug, autumn=Sep-Nov, winter=Dec-Feb
+    weather_city_sigma: Option<HashMap<String, Vec<f64>>>,
 }
 
 // ── Public types ───────────────────────────────────────────────────────────────
@@ -146,6 +176,7 @@ pub enum StrategyType {
     Mention,
     Weather,
     WeatherLadder,
+    WeatherCustomized,
 }
 
 impl StrategyType {
@@ -158,6 +189,8 @@ impl StrategyType {
             StrategyType::Weather
         } else if s.eq_ignore_ascii_case("weather_ladder") {
             StrategyType::WeatherLadder
+        } else if s.eq_ignore_ascii_case("weather_customized") {
+            StrategyType::WeatherCustomized
         } else {
             StrategyType::DumpHedge
         }
@@ -226,9 +259,21 @@ pub struct StrategyConfig {
     pub forecast_shift_threshold: f64,
     /// Consensus mode only: max allowed probability divergence among models
     pub consensus_max_divergence: f64,
+    /// Additive correction applied to model forecast temperature before CDF calculation.
+    pub forecast_temp_bias_celsius: f64,
+    /// STOP_LOSS tick filter: consecutive ticks below stop floor needed to exit.
+    pub min_sl_ticks: u32,
     /// Background loop interval in seconds for strategies with polling loops
     pub loop_interval_sec: u64,
 
+    // ── WeatherCustomized 專用 ────────────────────────────────────────────────
+    pub customized_lookback_ticks: u32,
+    pub customized_min_slope: f64,
+    pub customized_min_entry_price: f64,
+    pub customized_max_entry_price: f64,
+    pub customized_min_history_ticks: u32,
+    pub customized_max_ensemble_spread_celsius: f64,
+    pub customized_max_positions_per_city: usize,
     // ── WeatherLadder 專用 ─────────────────────────────────────────────────────
     pub ladder_min_leg_price: f64,
     pub ladder_max_leg_price: f64,
@@ -286,6 +331,10 @@ pub struct BotConfig {
 
     // ── 策略清單 ───────────────────────────────────────────────────────────────
     pub strategies: Vec<StrategyConfig>,
+
+    // ── 氣象城市 sigma 季節性係數 ─────────────────────────────────────────────
+    /// city → [spring, summer, autumn, winter] sigma multipliers (1.0 = no adjustment)
+    pub weather_city_sigma: HashMap<String, Vec<f64>>,
 }
 
 impl StrategyConfig {
@@ -324,6 +373,7 @@ impl BotConfig {
                     StrategyType::Mention => 60,
                     StrategyType::Weather => 15 * 60,
                     StrategyType::WeatherLadder => 3600,
+                    StrategyType::WeatherCustomized => 15 * 60,
                     StrategyType::DumpHedge | StrategyType::PureArb => 60,
                 };
                 StrategyConfig {
@@ -363,9 +413,19 @@ impl BotConfig {
                     weather_max_lead_days:    s.weather_max_lead_days.unwrap_or(14),
                     city_whitelist:           s.city_whitelist.unwrap_or_default(),
                     weather_forecast_model:   s.weather_forecast_model.unwrap_or_else(|| "gfs".to_string()),
-                    forecast_shift_threshold: s.forecast_shift_threshold.unwrap_or(0.15),
-                    consensus_max_divergence: s.consensus_max_divergence.unwrap_or(0.10),
-                    loop_interval_sec:        s.loop_interval_sec.unwrap_or(default_loop_interval_sec),
+                    forecast_shift_threshold:   s.forecast_shift_threshold.unwrap_or(0.15),
+                    consensus_max_divergence:   s.consensus_max_divergence.unwrap_or(0.10),
+                    forecast_temp_bias_celsius: s.forecast_temp_bias_celsius.unwrap_or(0.0),
+                    min_sl_ticks:               s.min_sl_ticks.unwrap_or(2),
+                    loop_interval_sec:          s.loop_interval_sec.unwrap_or(default_loop_interval_sec),
+                    // WeatherCustomized-specific
+                    customized_lookback_ticks:              s.customized_lookback_ticks.unwrap_or(4),
+                    customized_min_slope:                   s.customized_min_slope.unwrap_or(0.0),
+                    customized_min_entry_price:             s.customized_min_entry_price.unwrap_or(0.30),
+                    customized_max_entry_price:             s.customized_max_entry_price.unwrap_or(0.85),
+                    customized_min_history_ticks:           s.customized_min_history_ticks.unwrap_or(3),
+                    customized_max_ensemble_spread_celsius: s.customized_max_ensemble_spread_celsius.unwrap_or(4.0),
+                    customized_max_positions_per_city:      s.customized_max_positions_per_city.unwrap_or(3),
                     // WeatherLadder-specific
                     ladder_min_leg_price:                 s.ladder_min_leg_price.unwrap_or(0.0002),
                     ladder_max_leg_price:                 s.ladder_max_leg_price.unwrap_or(0.15),
@@ -415,6 +475,7 @@ impl BotConfig {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
 
             strategies,
+            weather_city_sigma: raw.weather_city_sigma.unwrap_or_default(),
         })
     }
 
@@ -429,5 +490,27 @@ impl BotConfig {
     /// 計算單筆訂單的費用（taker fee + gas）
     pub fn compute_fee(&self, size_usdc: f64) -> f64 {
         size_usdc * self.taker_fee_pct + self.gas_fee_usdc
+    }
+
+    /// Return the seasonal sigma multiplier for `city`.
+    ///
+    /// Looks up `weather_city_sigma[city][season]` where season is derived from
+    /// the current UTC month: spring=0 (Mar-May), summer=1 (Jun-Aug),
+    /// autumn=2 (Sep-Nov), winter=3 (Dec-Feb).
+    /// Returns 1.0 if the city is not configured.
+    pub fn city_sigma_mult(&self, city: &str) -> f64 {
+        use chrono::Datelike;
+        let month = chrono::Utc::now().month();
+        let season: usize = match month {
+            3..=5  => 0,
+            6..=8  => 1,
+            9..=11 => 2,
+            _      => 3,
+        };
+        self.weather_city_sigma
+            .get(city)
+            .and_then(|v| v.get(season))
+            .copied()
+            .unwrap_or(1.0)
     }
 }

@@ -26,6 +26,10 @@ use std::collections::HashMap;
 
 use crate::api::weather::{CityInfo, WeatherForecast, WeatherModel};
 use crate::error::AppError;
+use crate::rate_limit::token_bucket::backoff;
+
+const RETRY_ATTEMPTS: u32 = 3;
+const RETRY_BASE_MS: u64 = 1_000;
 
 const FORECAST_BASE: &str = "https://api.open-meteo.com/v1/forecast";
 const ENSEMBLE_BASE: &str = "https://ensemble-api.open-meteo.com/v1/ensemble";
@@ -69,19 +73,40 @@ pub async fn fetch_gfs_hourly_agg(
 
     tracing::debug!("[OpenMeteo] GFS hourly GET {url}");
 
-    let text = CLIENT
-        .get(&url)
-        .send()
-        .await
-        .map_err(AppError::Http)?
-        .error_for_status()
-        .map_err(AppError::Http)?
-        .text()
-        .await
-        .map_err(AppError::Http)?;
-
-    let raw: HourlyResponse = serde_json::from_str(&text).map_err(AppError::Json)?;
-    parse_hourly_agg_response(&raw, city, WeatherModel::Gfs, days)
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt - 1, RETRY_BASE_MS).await;
+        }
+        let result = async {
+            CLIENT
+                .get(&url)
+                .send()
+                .await
+                .map_err(AppError::Http)?
+                .error_for_status()
+                .map_err(AppError::Http)?
+                .text()
+                .await
+                .map_err(AppError::Http)
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let raw: HourlyResponse =
+                    serde_json::from_str(&text).map_err(AppError::Json)?;
+                return parse_hourly_agg_response(&raw, city, WeatherModel::Gfs, days);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[OpenMeteo] GFS hourly {} fetch 失敗 ({}/{}): {e}",
+                    city.name, attempt + 1, RETRY_ATTEMPTS
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ApiError("GFS hourly retry exhausted".to_string())))
 }
 
 /// Fetch ECMWF IFS deterministic forecast for `city` over the next `days` days.
@@ -116,21 +141,40 @@ pub async fn fetch_ensemble(
 
     tracing::debug!("[OpenMeteo] Ensemble GET {url}");
 
-    let text = CLIENT
-        .get(&url)
-        .send()
-        .await
-        .map_err(AppError::Http)?
-        .error_for_status()
-        .map_err(AppError::Http)?
-        .text()
-        .await
-        .map_err(AppError::Http)?;
-
-    let raw: EnsembleResponse =
-        serde_json::from_str(&text).map_err(AppError::Json)?;
-
-    parse_ensemble_response(&raw, city, days)
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt - 1, RETRY_BASE_MS).await;
+        }
+        let result = async {
+            CLIENT
+                .get(&url)
+                .send()
+                .await
+                .map_err(AppError::Http)?
+                .error_for_status()
+                .map_err(AppError::Http)?
+                .text()
+                .await
+                .map_err(AppError::Http)
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let raw: EnsembleResponse =
+                    serde_json::from_str(&text).map_err(AppError::Json)?;
+                return parse_ensemble_response(&raw, city, days);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[OpenMeteo] Ensemble {} fetch 失敗 ({}/{}): {e}",
+                    city.name, attempt + 1, RETRY_ATTEMPTS
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ApiError("Ensemble retry exhausted".to_string())))
 }
 
 // ── Internal: deterministic (GFS / ECMWF) ────────────────────────────────────
@@ -154,21 +198,40 @@ async fn fetch_deterministic(
 
     tracing::debug!("[OpenMeteo] {model} GET {url}");
 
-    let text = CLIENT
-        .get(&url)
-        .send()
-        .await
-        .map_err(AppError::Http)?
-        .error_for_status()
-        .map_err(AppError::Http)?
-        .text()
-        .await
-        .map_err(AppError::Http)?;
-
-    let raw: ForecastResponse =
-        serde_json::from_str(&text).map_err(AppError::Json)?;
-
-    parse_forecast_response(&raw, city, model)
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt - 1, RETRY_BASE_MS).await;
+        }
+        let result = async {
+            CLIENT
+                .get(&url)
+                .send()
+                .await
+                .map_err(AppError::Http)?
+                .error_for_status()
+                .map_err(AppError::Http)?
+                .text()
+                .await
+                .map_err(AppError::Http)
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let raw: ForecastResponse =
+                    serde_json::from_str(&text).map_err(AppError::Json)?;
+                return parse_forecast_response(&raw, city, model);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[OpenMeteo] {model} {} fetch 失敗 ({}/{}): {e}",
+                    city.name, attempt + 1, RETRY_ATTEMPTS
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ApiError(format!("{model} retry exhausted"))))
 }
 
 // ── Parse deterministic response ──────────────────────────────────────────────

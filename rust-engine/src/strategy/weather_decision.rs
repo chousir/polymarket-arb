@@ -70,6 +70,13 @@ pub struct WeatherDecisionConfig {
     pub min_depth_usdc: f64,
     /// Position size in USDC (used to populate entry metadata)
     pub bet_size_usdc: f64,
+    /// Per-city seasonal sigma multiplier from BotConfig::city_sigma_mult() (1.0 = no adjustment)
+    pub city_sigma_mult: f64,
+    /// Additive bias applied to the model's forecast temperature before computing CDF
+    /// probabilities.  Positive = model is running cold, shift forecast up.
+    /// Applies only to CDF-based models (GFS / ECMWF); ensemble member counting is unaffected.
+    /// Default 0.0; set to +2.0 or +3.0 when systematic underestimation is observed.
+    pub forecast_temp_bias_celsius: f64,
 }
 
 /// Trade direction returned by the decision model.
@@ -148,6 +155,8 @@ pub fn probability_yes(
     forecast: &WeatherForecast,
     market: &WeatherMarket,
     min_ensemble_members: usize,
+    city_sigma_mult: f64,
+    bias_celsius: f64,
 ) -> Option<f64> {
     match market.market_type {
         WeatherMarketType::TempRange => {
@@ -166,8 +175,8 @@ pub fn probability_yes(
                 if forecast.member_count() < min_ensemble_members { return None; }
                 forecast.ensemble_prob_in_range(lo, hi)
             } else {
-                let sigma = temp_model_sigma(forecast.model, forecast.lead_days);
-                let mu = forecast.max_temp_c;
+                let sigma = temp_model_sigma(forecast.model, forecast.lead_days) * city_sigma_mult;
+                let mu = forecast.max_temp_c + bias_celsius;
                 Some(normal_cdf((hi - mu) / sigma) - normal_cdf((lo - mu) / sigma))
             }
         }
@@ -178,8 +187,8 @@ pub fn probability_yes(
                 let p_above = forecast.ensemble_prob_above(threshold)?;
                 Some(if extreme_is_above(&market.question) { p_above } else { 1.0 - p_above })
             } else {
-                let sigma = temp_model_sigma(forecast.model, forecast.lead_days);
-                let mu = forecast.max_temp_c;
+                let sigma = temp_model_sigma(forecast.model, forecast.lead_days) * city_sigma_mult;
+                let mu = forecast.max_temp_c + bias_celsius;
                 let p_above = 1.0 - normal_cdf((threshold - mu) / sigma);
                 Some(if extreme_is_above(&market.question) { p_above } else { 1.0 - p_above })
             }
@@ -235,9 +244,9 @@ pub fn evaluate_temp_range(
             None => return hold(0.0, "ensemble has no members".into(), "NO_MEMBERS"),
         }
     } else {
-        // Deterministic model: normal CDF
-        let sigma = temp_model_sigma(forecast.model, forecast.lead_days);
-        let mu = forecast.max_temp_c;
+        // Deterministic model: normal CDF with per-city seasonal sigma adjustment
+        let sigma = temp_model_sigma(forecast.model, forecast.lead_days) * cfg.city_sigma_mult;
+        let mu = forecast.max_temp_c + cfg.forecast_temp_bias_celsius;
         normal_cdf((hi - mu) / sigma) - normal_cdf((lo - mu) / sigma)
     };
 
@@ -280,8 +289,8 @@ fn evaluate_extreme(
             None => return hold(0.0, "ensemble has no members".into(), "NO_MEMBERS"),
         }
     } else {
-        let sigma = temp_model_sigma(forecast.model, forecast.lead_days);
-        let mu = forecast.max_temp_c;
+        let sigma = temp_model_sigma(forecast.model, forecast.lead_days) * cfg.city_sigma_mult;
+        let mu = forecast.max_temp_c + cfg.forecast_temp_bias_celsius;
         let p_above = 1.0 - normal_cdf((threshold - mu) / sigma);
         if is_above { p_above } else { 1.0 - p_above }
     };
@@ -315,11 +324,15 @@ fn score_signal(
     hi: f64,
     is_temprange: bool,
 ) -> WeatherSignal {
+    // One-way cost: entry taker fee + slippage.
+    // Weather positions exit at resolution ($1.00, no exit fee) or early (TAKE_PROFIT/STOP_LOSS).
+    // Charging only the entry leg matches the dominant TIME_DECAY_EXIT path; TAKE_PROFIT/STOP_LOSS
+    // paths are accounted for via min_net_edge_bps margin.
     let cost_frac = (cfg.taker_fee_bps + cfg.slippage_buffer_bps) / 10_000.0;
     let min_edge = cfg.min_net_edge_bps / 10_000.0;
 
-    let edge_yes = p_yes - snapshot.yes_best_ask - cost_frac * 2.0;
-    let edge_no  = (1.0 - p_yes) - snapshot.no_best_ask - cost_frac * 2.0;
+    let edge_yes = p_yes - snapshot.yes_best_ask - cost_frac;
+    let edge_no  = (1.0 - p_yes) - snapshot.no_best_ask - cost_frac;
 
     if edge_yes >= min_edge && edge_yes >= edge_no {
         // Direction-specific confidence gate for BUY_YES
@@ -610,6 +623,8 @@ mod tests {
             max_spread: 0.08,
             min_depth_usdc: 50.0,
             bet_size_usdc: 20.0,
+            city_sigma_mult: 1.0,
+            forecast_temp_bias_celsius: 0.0,
         }
     }
 
@@ -781,13 +796,14 @@ mod tests {
 
     #[test]
     fn edge_formula_manual_check() {
-        // Manual: p_yes=0.70, yes_ask=0.52, fee=180+50=230 bps = 0.023
-        // edge_yes = 0.70 - 0.52 - 0.046 = 0.134 = 1340 bps (entry+exit fee)
+        // p_yes=0.70, yes_ask=0.52, fee=180+50=230 bps = 0.023 (entry only)
+        // Weather exits at resolution pay no exit fee, so charge 1× entry cost.
+        // edge_yes = 0.70 - 0.52 - 0.023 = 0.157 = 1570 bps
         let p_yes = 0.70_f64;
         let yes_ask = 0.52_f64;
-        let cost_frac = (180.0 + 50.0) / 10_000.0; // one-way fee
-        let edge = p_yes - yes_ask - cost_frac * 2.0;
-        assert!((edge - 0.134).abs() < 0.001);
-        assert!((edge * 10_000.0 - 1340.0).abs() < 1.0);
+        let cost_frac = (180.0 + 50.0) / 10_000.0;
+        let edge = p_yes - yes_ask - cost_frac;
+        assert!((edge - 0.157).abs() < 0.001);
+        assert!((edge * 10_000.0 - 1570.0).abs() < 1.0);
     }
 }

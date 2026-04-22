@@ -8,4 +8,5 @@ pub mod signal;
 pub mod weather_decision;
 pub mod weather_executor;
 pub mod weather_filter;
+pub mod weather_customized_executor;
 pub mod weather_ladder_executor;

@@ -37,13 +37,29 @@ pub enum WeatherModel {
 impl std::fmt::Display for WeatherModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WeatherModel::Nws      => write!(f, "nws"),
-            WeatherModel::Gfs      => write!(f, "gfs"),
-            WeatherModel::Ecmwf    => write!(f, "ecmwf"),
-            WeatherModel::Ensemble => write!(f, "ensemble"),
-            WeatherModel::Consensus => write!(f, "consensus"),
+            WeatherModel::Nws        => write!(f, "nws"),
+            WeatherModel::Gfs        => write!(f, "gfs"),
+            WeatherModel::Ecmwf      => write!(f, "ecmwf"),
+            WeatherModel::Ensemble   => write!(f, "ensemble"),
+            WeatherModel::Consensus  => write!(f, "consensus"),
             WeatherModel::MetarShort => write!(f, "metar_short"),
-            WeatherModel::Metar    => write!(f, "metar"),
+            WeatherModel::Metar      => write!(f, "metar"),
+        }
+    }
+}
+
+impl std::str::FromStr for WeatherModel {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "nws"         => Ok(WeatherModel::Nws),
+            "gfs"         => Ok(WeatherModel::Gfs),
+            "ecmwf"       => Ok(WeatherModel::Ecmwf),
+            "ensemble"    => Ok(WeatherModel::Ensemble),
+            "consensus"   => Ok(WeatherModel::Consensus),
+            "metar_short" => Ok(WeatherModel::MetarShort),
+            "metar"       => Ok(WeatherModel::Metar),
+            _             => Err(()),
         }
     }
 }

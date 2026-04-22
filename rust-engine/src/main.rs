@@ -81,7 +81,7 @@ async fn main() -> Result<(), AppError> {
     for sc in config.strategies.iter().filter(|s| s.enabled) {
         let cap = capital::new_shared(sc);
         {
-            let c = cap.lock().expect("capital mutex poisoned");
+            let c = cap.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
             tracing::info!(
                 "[Capital:{}] 初始資金={:.2} USDC  drawdown_stop={:.0}%  bet_size={:.2} USDC",
                 sc.id,
@@ -116,7 +116,7 @@ async fn main() -> Result<(), AppError> {
                                 0.0
                             };
                             cap.lock()
-                                .expect("capital mutex poisoned")
+                                .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                                 .override_from_onchain(allocated);
                         }
                     }
@@ -220,13 +220,13 @@ async fn main() -> Result<(), AppError> {
                 interval.tick().await;
                 let trades = db_stats.count_dry_run_trades().await.unwrap_or(-1);
                 let cycles = db_stats.count_cycle_results().await.unwrap_or(-1);
-                let daily_pnl = breaker_stats.lock().unwrap().daily_pnl();
+                let daily_pnl = breaker_stats.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] circuit breaker: {e}"); e.into_inner() }).daily_pnl();
                 tracing::info!(
                     "[Stats] 已完成週期={cycles}  dry_run_trades={trades}  \
                      今日PnL={daily_pnl:+.4} USDC"
                 );
                 for (id, cap) in &capitals_stats {
-                    let c = cap.lock().unwrap();
+                    let c = cap.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                     tracing::info!(
                         "[Capital:{}] current={:.4}  drawdown={:.1}%  fees_paid={:.4}  \
                          est_pnl={:.4}{}",
@@ -320,6 +320,32 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
+    // ── 11d. Spawn WeatherCustomized strategies as independent background tasks ─
+    {
+        let customized_strategies: Vec<_> = config
+            .strategies
+            .iter()
+            .filter(|s| s.enabled && s.strategy_type == StrategyType::WeatherCustomized)
+            .collect();
+
+        for sc in customized_strategies {
+            let global = config.clone();
+            let sc = sc.clone();
+            let cap = capitals
+                .get(&sc.id)
+                .map(Arc::clone)
+                .expect("capital tracker missing for weather customized strategy");
+            let db = db.clone();
+
+            tracing::info!("[Customized:{}] 啟動背景掃描任務", sc.id);
+            tokio::spawn(async move {
+                strategy::weather_customized_executor::WeatherCustomizedStrategy::new(global, sc, cap)
+                    .run_loop(&db)
+                    .await;
+            });
+        }
+    }
+
     // ── 12. Main cycle loop (BTC strategies only) ─────────────────────────────
     tracing::info!("[Main] 進入主循環");
     if let Some(t) = &telegram {
@@ -339,7 +365,7 @@ async fn main() -> Result<(), AppError> {
     loop {
         // ── Circuit breaker gate ──────────────────────────────────────────────
         {
-            let cb = breaker.lock().unwrap();
+            let cb = breaker.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] circuit breaker: {e}"); e.into_inner() });
             if cb.is_tripped() {
                 tracing::warn!("[Main] Circuit breaker 已觸發，跳過本循環（30s 後重檢）");
                 drop(cb);
@@ -384,7 +410,7 @@ async fn main() -> Result<(), AppError> {
         }
 
         // ── Subscribe + build combined feed, then fan out ─────────────────────
-        // Exclude Mention, Weather, WeatherLadder — they run in their own background tasks.
+        // Exclude Mention, Weather, WeatherLadder, WeatherCustomized — they run in their own background tasks.
         let active: Vec<(StrategyConfig, SharedCapital)> = config
             .strategies
             .iter()
@@ -393,6 +419,7 @@ async fn main() -> Result<(), AppError> {
                     && s.strategy_type != StrategyType::Mention
                     && s.strategy_type != StrategyType::Weather
                     && s.strategy_type != StrategyType::WeatherLadder
+                    && s.strategy_type != StrategyType::WeatherCustomized
             })
             .filter_map(|s| {
                 capitals.get(&s.id).map(|cap| (s.clone(), Arc::clone(cap)))
@@ -427,12 +454,13 @@ async fn main() -> Result<(), AppError> {
                                 .run_market_cycle(&info, &db, rx)
                                 .await
                         }
-                        // Mention, Weather, WeatherLadder are spawned as persistent
-                        // background tasks above and never reach this BTC cycle fanout.
+                        // Mention/Weather/WeatherLadder/WeatherCustomized are spawned as
+                        // persistent background tasks above and never reach this BTC cycle fanout.
                         StrategyType::Mention
                         | StrategyType::Weather
-                        | StrategyType::WeatherLadder => unreachable!(
-                            "Mention/Weather/WeatherLadder strategy should not appear in BTC cycle fanout"
+                        | StrategyType::WeatherLadder
+                        | StrategyType::WeatherCustomized => unreachable!(
+                            "Mention/Weather/WeatherLadder/WeatherCustomized should not appear in BTC cycle fanout"
                         ),
                     }
                 })
@@ -451,8 +479,8 @@ async fn main() -> Result<(), AppError> {
                         result.pnl_usdc,
                     );
 
-                    let events = breaker.lock().unwrap().record_cycle(&result);
-                    let daily_pnl = breaker.lock().unwrap().daily_pnl();
+                    let events = breaker.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] circuit breaker: {e}"); e.into_inner() }).record_cycle(&result);
+                    let daily_pnl = breaker.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] circuit breaker: {e}"); e.into_inner() }).daily_pnl();
 
                     if let Some(t) = &telegram {
                         t.notify_cycle_end(&result, daily_pnl).await;

@@ -50,7 +50,7 @@ impl DumpHedgeStrategy {
         let abort_at = Instant::now() + Duration::from_secs(secs_to_abort);
 
         {
-            let cap = self.capital.lock().expect("capital mutex poisoned");
+            let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
             tracing::info!(
                 "[DumpHedge:{}] 開始週期  slug={}  secs_to_close={secs_to_close}  \
                  dump_threshold={:.0}%  hedge_sum_threshold={}  \
@@ -127,7 +127,7 @@ impl DumpHedgeStrategy {
         let fee_per_leg = self.global.compute_fee(cycle.leg1_bet_size);
         self.capital
             .lock()
-            .expect("capital mutex poisoned")
+            .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
             .on_cycle_end(
                 cycle.leg1_fill_price,
                 cycle.leg2_fill_price,

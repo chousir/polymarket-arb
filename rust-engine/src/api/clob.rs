@@ -43,6 +43,19 @@ pub struct BookSummary {
     pub depth_usdc: f64,
 }
 
+impl BookSummary {
+    /// Derive the complementary token's book using binary-market symmetry
+    /// (YES.ask + NO.bid ≈ 1, YES.bid + NO.ask ≈ 1).
+    /// Used as a fallback when a live fetch of the other side fails.
+    pub fn symmetric_complement(&self) -> Self {
+        BookSummary {
+            best_bid:   1.0 - self.best_ask,
+            best_ask:   1.0 - self.best_bid,
+            depth_usdc: self.depth_usdc,
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum MockFetchBookOutcome {

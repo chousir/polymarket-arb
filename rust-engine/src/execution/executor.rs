@@ -156,7 +156,7 @@ pub async fn submit_order(
         // 更新資金追蹤器：鎖定下注金額 + 扣除費用
         capital
             .lock()
-            .expect("capital mutex poisoned")
+            .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
             .on_order_submit(intent.size_usdc, intent.fee_usdc);
 
         return Ok(OrderResult::Simulated { order_id });
@@ -209,6 +209,7 @@ mod tests {
             db_path: ":memory:".to_string(),
             telegram_bot_token: String::new(),
             strategies: vec![],
+            weather_city_sigma: std::collections::HashMap::new(),
         }
     }
 
@@ -239,6 +240,9 @@ mod tests {
             min_net_edge_bps: 0.0,
             max_spread: 0.0,
             min_model_confidence: 0.60,
+            min_model_confidence_temprange: 0.60,
+            min_temprange_p_yes: 0.28,
+            min_ensemble_members: 10,
             weather_min_depth_usdc: 50.0,
             weather_min_lead_days: 1,
             weather_max_lead_days: 14,
@@ -246,7 +250,16 @@ mod tests {
             weather_forecast_model: "gfs".to_string(),
             forecast_shift_threshold: 0.15,
             consensus_max_divergence: 0.10,
+            forecast_temp_bias_celsius: 0.0,
+            min_sl_ticks: 2,
             loop_interval_sec: 60,
+            customized_lookback_ticks: 4,
+            customized_min_slope: 0.0,
+            customized_min_entry_price: 0.30,
+            customized_max_entry_price: 0.85,
+            customized_min_history_ticks: 3,
+            customized_max_ensemble_spread_celsius: 4.0,
+            customized_max_positions_per_city: 3,
             ladder_min_leg_price: 0.0002,
             ladder_max_leg_price: 0.15,
             ladder_min_payout_ratio: 80.0,

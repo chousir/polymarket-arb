@@ -91,7 +91,7 @@ impl WeatherLadderStrategy {
 
             // Circuit breaker
             {
-                let cap = self.capital.lock().expect("capital mutex poisoned");
+                let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                 if cap.is_stopped() {
                     tracing::warn!("[Ladder:{}] 停損觸發，暫停本輪", self.sc.id);
                     continue;
@@ -166,9 +166,8 @@ impl WeatherLadderStrategy {
                     }).await;
                 }
                 let fee = self.sc.global_taker_fee() * ladder.total_size_usdc;
-                let _ = self.capital.lock().map(|mut cap| {
-                    cap.on_cycle_end(None, None, ladder.total_size_usdc, fee);
-                });
+                self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                    .on_cycle_end(None, None, ladder.total_size_usdc, fee);
                 to_remove.push(idx);
                 continue;
             }
@@ -211,9 +210,8 @@ impl WeatherLadderStrategy {
                             )),
                         }).await;
                     }
-                    let _ = self.capital.lock().map(|mut cap| {
-                        cap.on_cycle_end(None, Some(0.0), ladder.total_size_usdc, ladder.total_size_usdc);
-                    });
+                    self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                        .on_cycle_end(None, Some(0.0), ladder.total_size_usdc, ladder.total_size_usdc);
                     to_remove.push(idx);
                 }
             }
@@ -226,12 +224,14 @@ impl WeatherLadderStrategy {
 
     async fn evaluate_current_combined_p(&self, ladder: &OpenLadder) -> Option<f64> {
         let info = city_info(&ladder.city)?;
-        let forecasts = weather_executor::fetch_city_forecast_single(info, WeatherModel::Gfs).await?;
+        let forecast_days = self.sc.weather_max_lead_days + weather_executor::FORECAST_LEAD_BUFFER;
+        let forecasts = weather_executor::fetch_city_forecast_single(info, WeatherModel::Gfs, forecast_days).await?;
         let fc = find_forecast_for_date(&forecasts, ladder.target_date)?;
 
+        let csm = self.global.city_sigma_mult(&ladder.city);
         let mut combined = 0.0_f64;
         for leg in &ladder.legs {
-            if let Some(p) = weather_decision::probability_yes(fc, &leg.market, self.sc.min_ensemble_members) {
+            if let Some(p) = weather_decision::probability_yes(fc, &leg.market, self.sc.min_ensemble_members, csm, self.sc.forecast_temp_bias_celsius) {
                 combined += p;
             }
         }
@@ -352,8 +352,9 @@ impl WeatherLadderStrategy {
                     None => continue,
                 };
                 let forecast_model = WeatherModel::Gfs;
+                let forecast_days = self.sc.weather_max_lead_days + weather_executor::FORECAST_LEAD_BUFFER;
                 let forecasts = match weather_executor::fetch_city_forecast_single(
-                    info, forecast_model
+                    info, forecast_model, forecast_days
                 ).await {
                     Some(f) => f,
                     None => {
@@ -366,11 +367,12 @@ impl WeatherLadderStrategy {
                     None => continue,
                 };
 
-                // Calculate combined p_yes
+                // Calculate combined p_yes (apply per-city seasonal sigma multiplier)
+                let csm = self.global.city_sigma_mult(&city);
                 let mut combined_p = 0.0_f64;
                 let mut leg_ps: Vec<f64> = Vec::new();
                 for (market, _price) in &cluster {
-                    let p = weather_decision::probability_yes(fc, market, self.sc.min_ensemble_members).unwrap_or(0.0);
+                    let p = weather_decision::probability_yes(fc, market, self.sc.min_ensemble_members, csm, self.sc.forecast_temp_bias_celsius).unwrap_or(0.0);
                     leg_ps.push(p);
                     combined_p += p;
                 }
@@ -442,9 +444,8 @@ impl WeatherLadderStrategy {
 
                 let total_size = size_per_leg * leg_count as f64;
                 let fee = self.sc.global_taker_fee() * total_size;
-                let _ = self.capital.lock().map(|mut cap| {
-                    cap.on_order_submit(total_size, fee);
-                });
+                self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                    .on_order_submit(total_size, fee);
 
                 new_ladders.push(OpenLadder {
                     ladder_id,

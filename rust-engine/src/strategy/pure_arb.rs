@@ -68,7 +68,7 @@ impl PureArbStrategy {
         let abort_at = Instant::now() + Duration::from_secs(secs_to_abort);
 
         {
-            let cap = self.capital.lock().expect("capital mutex poisoned");
+            let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
             tracing::info!(
                 "[PureArb:{}] 開始週期  slug={}  secs_to_close={secs_to_close}  \
                  hedge_sum_threshold={}  capital={:.4} USDC  bet_size={:.4} USDC{}",
@@ -147,7 +147,7 @@ impl PureArbStrategy {
         let fee_per_leg = self.global.compute_fee(leg1_bet_size);
         self.capital
             .lock()
-            .expect("capital mutex poisoned")
+            .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
             .on_cycle_end(leg1_price, leg2_price, leg1_bet_size, fee_per_leg);
 
         // ── Build CycleResult ─────────────────────────────────────────────────
@@ -238,7 +238,7 @@ impl PureArbStrategy {
 
                 // ── Check drawdown stop ───────────────────────────────────────
                 {
-                    let cap = self.capital.lock().expect("capital mutex poisoned");
+                    let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                     if cap.is_stopped() {
                         tracing::warn!(
                             "[PureArb:{}] ⛔ 停損觸發，跳過本次套利  drawdown={:.1}%",
@@ -252,7 +252,7 @@ impl PureArbStrategy {
                 let bet_size = self
                     .capital
                     .lock()
-                    .expect("capital mutex poisoned")
+                    .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .current_bet_size();
                 let fee_usdc = self.global.compute_fee(bet_size);
 

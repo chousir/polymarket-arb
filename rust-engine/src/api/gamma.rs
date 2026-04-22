@@ -59,7 +59,7 @@ pub fn next_open_ts() -> u64 {
 pub async fn fetch_market(slug: &str) -> Result<MarketInfo, crate::error::AppError> {
     // ── Cache read (lock released before any await) ───────────────────────────
     {
-        let cache = MARKET_CACHE.lock().unwrap();
+        let cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] market cache: {e}"); e.into_inner() });
         if let Some((fetched_at, info)) = cache.get(slug) {
             if fetched_at.elapsed() < CACHE_TTL {
                 return Ok(info.clone());
@@ -74,7 +74,8 @@ pub async fn fetch_market(slug: &str) -> Result<MarketInfo, crate::error::AppErr
 
     // ── Cache write ───────────────────────────────────────────────────────────
     {
-        let mut cache = MARKET_CACHE.lock().unwrap();
+        let mut cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] market cache: {e}"); e.into_inner() });
+        cache.retain(|_, (fetched_at, _)| fetched_at.elapsed() < CACHE_TTL);
         cache.insert(slug.to_string(), (Instant::now(), info.clone()));
     }
 
@@ -89,6 +90,49 @@ pub async fn fetch_resolved_outcome(
 ) -> Result<Option<ResolvedOutcome>, crate::error::AppError> {
     let market = fetch_market_raw(slug).await?;
     Ok(market.resolved_outcome())
+}
+
+/// Check the settlement price of a specific token in any market (works for weather,
+/// Up/Down, and any multi-outcome market).
+///
+/// Returns:
+///   `Ok(Some(1.0))` — our token is the winner (worth $1 at settlement).
+///   `Ok(Some(0.0))` — our token lost (worth $0 at settlement).
+///   `Ok(None)`      — market not yet resolved; caller should retry later.
+pub async fn fetch_token_settlement_price(
+    slug: &str,
+    token_id: &str,
+) -> Result<Option<f64>, crate::error::AppError> {
+    let market = fetch_market_raw(slug).await?;
+
+    // Fast path: winning token ID is explicitly provided.
+    if let Some(winner_token) = market.winner.as_deref() {
+        if !winner_token.is_empty() {
+            return Ok(Some(if winner_token == token_id { 1.0 } else { 0.0 }));
+        }
+    }
+
+    // Fallback: scan outcome_prices aligned with clob_token_ids.
+    if let (Some(prices_raw), Ok(token_ids)) = (
+        market.outcome_prices.as_deref(),
+        serde_json::from_str::<Vec<String>>(&market.clob_token_ids),
+    ) {
+        if let Ok(prices) = serde_json::from_str::<Vec<String>>(prices_raw) {
+            for (i, tid) in token_ids.iter().enumerate() {
+                let price = prices.get(i)
+                    .and_then(|p| p.parse::<f64>().ok())
+                    .unwrap_or(0.5);
+                if tid == token_id {
+                    if price >= 0.999 { return Ok(Some(1.0)); }
+                    if price <= 0.001 { return Ok(Some(0.0)); }
+                    // Price is still mid-range — not settled yet.
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 async fn fetch_market_raw(slug: &str) -> Result<GammaMarket, crate::error::AppError> {

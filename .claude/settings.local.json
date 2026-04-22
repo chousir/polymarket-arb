@@ -20,7 +20,9 @@
       "Bash(python -c \"from src.dashboard.app import app; print\\('OK'\\)\")",
       "Bash(python -c \"from src.dashboard.app import app; routes = [r.path for r in app.routes]; [print\\(r\\) for r in sorted\\(routes\\) if 'mention' in r or 'strategy' in r]\")",
       "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db \"SELECT action, COUNT\\(*\\) FROM weather_dry_run_trades GROUP BY action;\")",
-      "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db ':*)"
+      "Bash(sqlite3 /home/user/polymarket-arb/data/market_snapshots.db ':*)",
+      "Bash(cargo check *)",
+      "Bash(git stash *)"
     ]
   }
 }

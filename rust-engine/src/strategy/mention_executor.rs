@@ -93,7 +93,7 @@ impl MentionStrategy {
 
             // ── Circuit-breaker / drawdown gate ────────────────────────────────
             {
-                let cap = self.capital.lock().expect("capital mutex poisoned");
+                let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                 if cap.is_stopped() {
                     tracing::warn!(
                         "[Mention:{}] ⛔ 停損觸發（capital={:.4}），暫停本輪掃描",
@@ -168,7 +168,7 @@ impl MentionStrategy {
                         note:                     None,
                     }).await;
                 }
-                self.capital.lock().expect("capital mutex poisoned")
+                self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), None, pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
                 to_remove.push(idx);
@@ -224,7 +224,7 @@ impl MentionStrategy {
                         note:                   None,
                     }).await;
                 }
-                self.capital.lock().expect("capital mutex poisoned")
+                self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
                 to_remove.push(idx);
@@ -269,7 +269,7 @@ impl MentionStrategy {
                         note:                   None,
                     }).await;
                 }
-                self.capital.lock().expect("capital mutex poisoned")
+                self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
                 to_remove.push(idx);
@@ -449,7 +449,7 @@ impl MentionStrategy {
                 };
 
                 let bet_size = {
-                    let cap = self.capital.lock().expect("capital mutex poisoned");
+                    let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                     if cap.is_stopped() {
                         tracing::warn!(
                             "[Mention:{}] {} — 停損觸發，跳過入場", self.sc.id, slug
@@ -488,7 +488,7 @@ impl MentionStrategy {
 
                     self.capital
                         .lock()
-                        .expect("capital mutex poisoned")
+                        .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                         .on_order_submit(bet_size, fee_usdc);
 
                     tracing::info!(
@@ -555,7 +555,7 @@ impl MentionStrategy {
 
     fn make_decision_cfg(&self) -> MentionDecisionConfig {
         let bet_size = {
-            let cap = self.capital.lock().expect("capital mutex poisoned");
+            let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
             cap.current_bet_size()
         };
         MentionDecisionConfig {

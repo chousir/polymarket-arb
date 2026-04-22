@@ -1,34 +1,39 @@
-# 多階段構建：Rust 引擎 + Python 分析層
+# 多階段構建：Rust 引擎 + 前端 + Python 分析層
 # Rust 最低需求：1.86（icu_* crates 需要）
 # 若升級依賴後出現 "rustc X.Y is not supported" 錯誤，請同步更新此版本號
 FROM rust:1.86 AS rust-builder
 
 WORKDIR /build
 
-# 複製 Rust 工程及配置
 COPY rust-engine/ ./rust-engine/
 COPY config/ ./config/
 
-# 構築發佈二進制
 RUN cd rust-engine && \
     cargo build --release && \
     cp target/release/polymarket-engine /tmp/polymarket-engine
 
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Python + Node.js runtime 階段
+# 前端構建階段（Node.js 不進最終 image）
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /frontend
+
+COPY python-analytics/src/dashboard/frontend/ ./
+
+RUN npm install && npm run build
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Python runtime 階段（無 Node.js / npm）
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# 安裝系統依賴
 RUN apt-get update && apt-get install -y \
     curl \
-    nodejs \
-    npm \
     && rm -rf /var/lib/apt/lists/*
 
-# 複製配置与工具
 COPY config/ ./config/
 COPY tools/ ./tools/
 
@@ -40,11 +45,8 @@ RUN chmod +x /app/bin/polymarket-engine
 COPY python-analytics/ ./python-analytics/
 RUN pip install --no-cache-dir -r python-analytics/requirements.txt
 
-# ── 建置前端 ────────────────────────────────────────────────────────────────
-RUN cd python-analytics/src/dashboard/frontend && \
-    npm install && \
-    npm run build && \
-    rm -rf node_modules
+# ── 注入已構建的前端靜態檔（不含 node_modules / npm）─────────────────────
+COPY --from=frontend-builder /frontend/dist ./python-analytics/src/dashboard/frontend/dist
 
 # ── 建立數據目錄 ────────────────────────────────────────────────────────────
 RUN mkdir -p /app/data
@@ -65,5 +67,4 @@ RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8080
 
-# 預設啟動 dry_run 模式（可透過環境變數 TRADING_MODE 覆蓋）
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

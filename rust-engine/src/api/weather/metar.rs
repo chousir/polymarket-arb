@@ -23,6 +23,10 @@ use serde::Deserialize;
 
 use crate::api::weather::{CityInfo, WeatherForecast, WeatherModel};
 use crate::error::AppError;
+use crate::rate_limit::token_bucket::backoff;
+
+const RETRY_ATTEMPTS: u32 = 3;
+const RETRY_BASE_MS: u64 = 1_000;
 
 const METAR_BASE: &str = "https://aviationweather.gov/api/data/metar";
 
@@ -51,28 +55,47 @@ pub async fn fetch_metar(
     );
     tracing::debug!("[METAR] GET {url}");
 
-    let text = CLIENT
-        .get(&url)
-        .send()
-        .await
-        .map_err(AppError::Http)?
-        .error_for_status()
-        .map_err(AppError::Http)?
-        .text()
-        .await
-        .map_err(AppError::Http)?;
-
-    let records: Vec<MetarRecord> =
-        serde_json::from_str(&text).map_err(AppError::Json)?;
-
-    // Most recent first — aviationweather.gov returns newest at index 0
-    let record = records.into_iter().next().ok_or_else(|| {
-        AppError::ApiError(format!(
-            "[METAR] no observations found for {} (ICAO: {})", city.name, city.icao
-        ))
-    })?;
-
-    parse_metar_record(&record, city)
+    let mut last_err: Option<AppError> = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        if attempt > 0 {
+            backoff(attempt - 1, RETRY_BASE_MS).await;
+        }
+        let result = async {
+            CLIENT
+                .get(&url)
+                .send()
+                .await
+                .map_err(AppError::Http)?
+                .error_for_status()
+                .map_err(AppError::Http)?
+                .text()
+                .await
+                .map_err(AppError::Http)
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let records: Vec<MetarRecord> =
+                    serde_json::from_str(&text).map_err(AppError::Json)?;
+                // Most recent first — aviationweather.gov returns newest at index 0
+                let record = records.into_iter().next().ok_or_else(|| {
+                    AppError::ApiError(format!(
+                        "[METAR] no observations found for {} (ICAO: {})",
+                        city.name, city.icao
+                    ))
+                })?;
+                return parse_metar_record(&record, city);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[METAR] {} fetch 失敗 ({}/{}): {e}",
+                    city.name, attempt + 1, RETRY_ATTEMPTS
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ApiError(format!("[METAR] {} retry exhausted", city.name))))
 }
 
 // ── Parse ─────────────────────────────────────────────────────────────────────
@@ -88,14 +111,19 @@ pub(crate) fn parse_metar_record(
     })?;
 
     // reportTime format: "2026-04-13 12:00:00" or ISO-8601 variant
-    let forecast_date = parse_metar_date(&record.report_time);
+    let forecast_date = parse_metar_date(&record.report_time).ok_or_else(|| {
+        AppError::ApiError(format!(
+            "[METAR] {} 無法解析 report_time: {:?}",
+            city.name, record.report_time
+        ))
+    })?;
 
     let fetched_at = Utc::now();
 
     Ok(WeatherForecast {
         city: city.name.to_string(),
         model: WeatherModel::Metar,
-        forecast_date: forecast_date.unwrap_or_else(|| fetched_at.date_naive()),
+        forecast_date,
         // METAR is current observation — max and min both equal current temp
         max_temp_c: temp_c,
         min_temp_c: temp_c,
@@ -203,12 +231,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_date_falls_back_to_today() {
+    fn malformed_date_returns_err() {
         let record = make_record(Some(20.0), "not-a-date");
-        // Should not error — falls back to today's date
-        let fc = parse_metar_record(&record, nyc()).unwrap();
-        let today = Utc::now().date_naive();
-        assert_eq!(fc.forecast_date, today);
+        assert!(parse_metar_record(&record, nyc()).is_err());
     }
 
     #[test]

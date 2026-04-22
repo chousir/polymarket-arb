@@ -44,7 +44,7 @@ pub async fn fetch_trump_mention_markets()
 {
     // ── Cache read ────────────────────────────────────────────────────────────
     {
-        let cache = MARKET_CACHE.lock().unwrap();
+        let cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] mention market cache: {e}"); e.into_inner() });
         if let Some((fetched_at, ref markets)) = *cache {
             if fetched_at.elapsed() < CACHE_TTL {
                 tracing::debug!("[MentionMkt] cache hit ({} markets)", markets.len());
@@ -94,7 +94,7 @@ pub async fn fetch_trump_mention_markets()
 
     // ── Cache write ───────────────────────────────────────────────────────────
     {
-        let mut cache = MARKET_CACHE.lock().unwrap();
+        let mut cache = MARKET_CACHE.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] mention market cache: {e}"); e.into_inner() });
         *cache = Some((Instant::now(), markets.clone()));
     }
 
