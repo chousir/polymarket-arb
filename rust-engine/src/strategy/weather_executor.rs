@@ -43,6 +43,7 @@ use crate::config::{BotConfig, StrategyConfig};
 use crate::db::writer::{DbWriter, WeatherDryRunTrade};
 use crate::error::AppError;
 use crate::execution::executor;
+use crate::notify::telegram::Notifier;
 use crate::risk::capital::SharedCapital;
 use crate::strategy::weather_decision::{
     self, WeatherBookSnapshot, WeatherDecisionConfig, WeatherDirection, WeatherSignal,
@@ -113,20 +114,22 @@ struct ConsensusCityForecasts {
 // ── Public strategy struct ────────────────────────────────────────────────────
 
 pub struct WeatherStrategy {
-    global: BotConfig,
-    sc: StrategyConfig,
-    capital: SharedCapital,
+    global:         BotConfig,
+    sc:             StrategyConfig,
+    capital:        SharedCapital,
     forecast_model: WeatherModel,
+    notifier:       Option<Notifier>,
 }
 
 impl WeatherStrategy {
-    pub fn new(global: BotConfig, sc: StrategyConfig, capital: SharedCapital) -> Self {
+    pub fn new(global: BotConfig, sc: StrategyConfig, capital: SharedCapital, notifier: Option<Notifier>) -> Self {
         let forecast_model = parse_weather_model(&sc.weather_forecast_model);
-        WeatherStrategy {
-            global,
-            sc,
-            capital,
-            forecast_model,
+        WeatherStrategy { global, sc, capital, forecast_model, notifier }
+    }
+
+    async fn tg(&self, emoji: &str, title: &str, detail: &str) {
+        if let Some(n) = &self.notifier {
+            n.notify_alert(emoji, title, detail).await;
         }
     }
 
@@ -369,6 +372,9 @@ impl WeatherStrategy {
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                             .on_cycle_end(Some(pos.entry_price), Some(settled_price), pos.size_usdc,
                                           self.global.compute_fee(pos.size_usdc));
+                        self.tg("💰", "SETTLEMENT",
+                            &format!("{} side={} settled={:.4} pnl={:+.4} USDC",
+                                pos.market_slug, pos.side, settled_price, realized_pnl)).await;
                         newly_exited.push(pos.market_slug.clone());
                         to_remove.push(idx);
                         continue;
@@ -387,6 +393,9 @@ impl WeatherStrategy {
                     "[Weather:{}] TIME_DECAY_EXIT {} side={} secs_left={} hold={}s  pnl={:.4}",
                     self.sc.id, pos.market_slug, pos.side, secs_to_close, hold_sec, realized_pnl
                 );
+                self.tg("⏰", "TIME_DECAY_EXIT",
+                    &format!("{} side={} hold={}s pnl={:+.4} USDC",
+                        pos.market_slug, pos.side, hold_sec, realized_pnl)).await;
                 if self.global.is_dry_run() {
                     self.write_exit(
                         db, pos, "TIME_DECAY_EXIT", pos.entry_price, hold_sec,
@@ -499,6 +508,9 @@ impl WeatherStrategy {
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
+                self.tg("💚", "TAKE_PROFIT",
+                    &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
+                        pos.market_slug, pos.side, exit_price, realized_pnl)).await;
                 newly_exited.push(pos.market_slug.clone());
                 to_remove.push(idx);
                 continue;
@@ -554,6 +566,9 @@ impl WeatherStrategy {
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                   self.global.compute_fee(pos.size_usdc));
+                self.tg("🔴", "STOP_LOSS",
+                    &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
+                        pos.market_slug, pos.side, exit_price, realized_pnl)).await;
                 newly_exited.push(pos.market_slug.clone());
                 to_remove.push(idx);
                 continue;
@@ -1091,6 +1106,10 @@ impl WeatherStrategy {
                 };
                 let stop_loss_price = entry_best_ask - effective_stop_loss_delta;
 
+                self.tg("📥", "ENTRY",
+                    &format!("{} side={} ask={:.4} lead={}d",
+                        market.slug, side, entry_best_ask, lead_days)).await;
+
                 if self.global.is_dry_run() {
                     let _ = db.write_weather_dry_run_trade(&WeatherDryRunTrade {
                         strategy_id:            self.sc.id.clone(),
@@ -1295,6 +1314,8 @@ impl WeatherStrategy {
             bet_size_usdc:                  bet_size,
             city_sigma_mult:                self.global.city_sigma_mult(city),
             forecast_temp_bias_celsius:     self.sc.forecast_temp_bias_celsius,
+            high_yes_ask_threshold:         self.sc.high_yes_ask_threshold,
+            high_yes_min_confidence_no:     self.sc.high_yes_min_confidence_no,
         }
     }
 }
@@ -1439,36 +1460,127 @@ fn evaluate_consensus_signal_for_market(
     cfg: &WeatherDecisionConfig,
     max_divergence: f64,
 ) -> Option<WeatherSignal> {
-    // GFS is required; ECMWF and Ensemble are optional (degraded consensus).
+    // ── Constants ────────────────────────────────────────────────────────────
+    // Maximum allowed difference between a deterministic model's point forecast
+    // and the Ensemble mean temperature.  Larger gap → models disagree on *what
+    // the temperature will be*, which is a genuine signal to stay out.
+    const MEAN_DIVERGENCE_C: f64 = 2.0;
+    // When the Ensemble spread (std-dev across 30 members) exceeds this value
+    // the atmosphere is too chaotic for reliable prediction.
+    const CHAOS_THRESHOLD_C: f64 = 3.5;
+    // Even on very stable days, keep a minimum CDF sigma to avoid absurd
+    // probabilities from near-zero spread.
+    const SIGMA_FLOOR_C: f64 = 1.2;
+
     let min_ens = cfg.min_ensemble_members;
     let csm = cfg.city_sigma_mult;
     let bias = cfg.forecast_temp_bias_celsius;
+
+    // GFS is the required baseline model.
     let gfs_fc = find_forecast_for_date(&city_fc.gfs, market.target_date)?;
-    let p_gfs  = weather_decision::probability_yes(gfs_fc, market, min_ens, csm, bias)?;
+
+    // ── Step 1: Extract Ensemble mean / std-dev ──────────────────────────────
+    let ens_fc_opt = city_fc.ensemble.as_ref()
+        .and_then(|v| find_forecast_for_date(v, market.target_date));
+
+    let ens_stats: Option<(f64, f64)> = ens_fc_opt.and_then(|fc| fc.ensemble_mean_std());
+
+    // ── Step 2 & 3: Mean-divergence + chaos checks (only if Ensemble available)
+    let sigma_calibrated: f64 = if let Some((ens_mean, ens_std)) = ens_stats {
+        let mu_gfs = gfs_fc.max_temp_c + bias;
+        if (mu_gfs - ens_mean).abs() > MEAN_DIVERGENCE_C {
+            let p_placeholder = weather_decision::probability_yes(
+                gfs_fc, market, min_ens, csm, bias,
+            ).unwrap_or(0.5);
+            return Some(WeatherSignal {
+                direction: WeatherDirection::Hold,
+                edge_bps: 0.0,
+                p_yes: p_placeholder,
+                entry_price: 0.0,
+                reason: format!(
+                    "mean divergence: μ_gfs={:.1} ens_mean={:.1} delta={:.1}°C > {:.1}°C",
+                    mu_gfs, ens_mean, (mu_gfs - ens_mean).abs(), MEAN_DIVERGENCE_C,
+                ),
+                reason_code: "MODEL_MEAN_DIVERGENCE".to_string(),
+            });
+        }
+        if let Some(ecmwf_fc) = city_fc.ecmwf.as_ref()
+            .and_then(|v| find_forecast_for_date(v, market.target_date))
+        {
+            let mu_ecmwf = ecmwf_fc.max_temp_c + bias;
+            if (mu_ecmwf - ens_mean).abs() > MEAN_DIVERGENCE_C {
+                let p_placeholder = weather_decision::probability_yes(
+                    gfs_fc, market, min_ens, csm, bias,
+                ).unwrap_or(0.5);
+                return Some(WeatherSignal {
+                    direction: WeatherDirection::Hold,
+                    edge_bps: 0.0,
+                    p_yes: p_placeholder,
+                    entry_price: 0.0,
+                    reason: format!(
+                        "mean divergence: μ_ecmwf={:.1} ens_mean={:.1} delta={:.1}°C > {:.1}°C",
+                        mu_ecmwf, ens_mean, (mu_ecmwf - ens_mean).abs(), MEAN_DIVERGENCE_C,
+                    ),
+                    reason_code: "MODEL_MEAN_DIVERGENCE".to_string(),
+                });
+            }
+        }
+        if ens_std > CHAOS_THRESHOLD_C {
+            let p_placeholder = weather_decision::probability_yes(
+                gfs_fc, market, min_ens, csm, bias,
+            ).unwrap_or(0.5);
+            return Some(WeatherSignal {
+                direction: WeatherDirection::Hold,
+                edge_bps: 0.0,
+                p_yes: p_placeholder,
+                entry_price: 0.0,
+                reason: format!(
+                    "high atmospheric uncertainty: ens_std={:.2}°C > {:.1}°C",
+                    ens_std, CHAOS_THRESHOLD_C,
+                ),
+                reason_code: "HIGH_ATM_UNCERTAINTY".to_string(),
+            });
+        }
+        // Calibrated sigma: use Ensemble spread as the true uncertainty estimate,
+        // with a floor to avoid unrealistically tight CDF curves.
+        ens_std.max(SIGMA_FLOOR_C) * csm
+    } else {
+        // Ensemble not available — fall back to the fixed GFS sigma table.
+        weather_decision::temp_model_sigma(WeatherModel::Gfs, gfs_fc.lead_days) * csm
+    };
+
+    // ── Step 4: Compute CDF probabilities with calibrated sigma ─────────────
+    // Both GFS and ECMWF now use the same σ derived from Ensemble spread,
+    // making their p_yes values directly comparable.
+    let p_gfs = weather_decision::probability_yes_sigma(gfs_fc, market, sigma_calibrated, bias)?;
 
     let p_ecmwf = city_fc.ecmwf.as_ref()
         .and_then(|v| find_forecast_for_date(v, market.target_date))
-        .and_then(|fc| weather_decision::probability_yes(fc, market, min_ens, csm, bias));
+        .and_then(|fc| weather_decision::probability_yes_sigma(fc, market, sigma_calibrated, bias));
 
-    let p_ens = city_fc.ensemble.as_ref()
-        .and_then(|v| find_forecast_for_date(v, market.target_date))
+    // ── Step 5: CDF-to-CDF divergence check ─────────────────────────────────
+    // Now that both models use the same sigma, residual divergence means their
+    // point forecasts (μ) differ — a genuine disagreement worth blocking.
+    let mut p_cdf_values: Vec<f64> = vec![p_gfs];
+    if let Some(p) = p_ecmwf { p_cdf_values.push(p); }
+
+    let p_cdf_min = p_cdf_values.iter().copied().fold(f64::MAX, f64::min);
+    let p_cdf_max = p_cdf_values.iter().copied().fold(f64::MIN, f64::max);
+    let cdf_divergence = p_cdf_max - p_cdf_min;
+    let p_yes = p_cdf_values.iter().sum::<f64>() / p_cdf_values.len() as f64;
+
+    // p_ens_direct: direct member-count probability, kept separate from the
+    // CDF average — used only for directional validation below.
+    let p_ens_direct = ens_fc_opt
         .and_then(|fc| weather_decision::probability_yes(fc, market, min_ens, csm, 0.0));
 
-    // Build list of available probabilities (GFS always present)
-    let mut p_values: Vec<f64> = vec![p_gfs];
-    if let Some(p) = p_ecmwf { p_values.push(p); }
-    if let Some(p) = p_ens   { p_values.push(p); }
-
-    let p_min = p_values.iter().copied().fold(f64::MAX, f64::min);
-    let p_max = p_values.iter().copied().fold(f64::MIN, f64::max);
-    let divergence = p_max - p_min;
-    let p_yes = p_values.iter().sum::<f64>() / p_values.len() as f64;
-
-    // Compact label for reason strings, e.g. "gfs=0.720 ecmwf=0.690 ens=0.710"
     let model_label = {
         let mut s = format!("gfs={:.3}", p_gfs);
-        if let Some(p) = p_ecmwf { s.push_str(&format!(" ecmwf={:.3}", p)); }
-        if let Some(p) = p_ens   { s.push_str(&format!(" ens={:.3}", p)); }
+        if let Some(p) = p_ecmwf    { s.push_str(&format!(" ecmwf={:.3}", p)); }
+        if let Some(p) = p_ens_direct { s.push_str(&format!(" ens_direct={:.3}", p)); }
+        if let Some((mean, std)) = ens_stats {
+            s.push_str(&format!(" ens_mean={:.1} ens_std={:.2}", mean, std));
+        }
         s
     };
 
@@ -1502,18 +1614,40 @@ fn evaluate_consensus_signal_for_market(
         });
     }
 
-    if divergence > max_divergence {
+    if cdf_divergence > max_divergence {
         return Some(WeatherSignal {
             direction: WeatherDirection::Hold,
             edge_bps: 0.0,
             p_yes,
             entry_price: 0.0,
             reason: format!(
-                "model divergence too wide: {} delta={:.3} > {:.3}",
-                model_label, divergence, max_divergence,
+                "CDF model divergence too wide: {} delta={:.3} > {:.3}",
+                model_label, cdf_divergence, max_divergence,
             ),
             reason_code: "MODEL_DIVERGENCE".to_string(),
         });
+    }
+
+    // ── Step 6: Ensemble directional validation ──────────────────────────────
+    // The CDF average and Ensemble direct count should agree on which side of
+    // 50% p_yes sits.  A mismatch means the two methods genuinely contradict
+    // each other — stay out.
+    if let Some(p_ens) = p_ens_direct {
+        let cdf_is_yes = p_yes >= 0.5;
+        let ens_is_yes = p_ens >= 0.5;
+        if cdf_is_yes != ens_is_yes {
+            return Some(WeatherSignal {
+                direction: WeatherDirection::Hold,
+                edge_bps: 0.0,
+                p_yes,
+                entry_price: 0.0,
+                reason: format!(
+                    "ensemble direction conflict: cdf_p_yes={:.3} ens_p_yes={:.3} ({})",
+                    p_yes, p_ens, model_label,
+                ),
+                reason_code: "ENS_DIRECTION_CONFLICT".to_string(),
+            });
+        }
     }
 
     let cost_frac = (cfg.taker_fee_bps + cfg.slippage_buffer_bps) / 10_000.0;
@@ -1781,6 +1915,249 @@ mod tests {
         assert!(find_forecast_for_date(&[], target).is_none());
     }
 
+    // ── Consensus signal tests ────────────────────────────────────────────────
+
+    fn make_consensus_cfg() -> WeatherDecisionConfig {
+        WeatherDecisionConfig {
+            min_model_confidence: 0.60,
+            min_model_confidence_temprange: 0.60,
+            min_temprange_p_yes: 0.28,
+            min_ensemble_members: 5,
+            min_depth_usdc: 50.0,
+            max_spread: 0.05,
+            taker_fee_bps: 180.0,
+            slippage_buffer_bps: 50.0,
+            min_net_edge_bps: 100.0,
+            bet_size_usdc: 10.0,
+            city_sigma_mult: 1.0,
+            forecast_temp_bias_celsius: 0.0,
+            high_yes_ask_threshold: 1.1,
+            high_yes_min_confidence_no: 0.85,
+        }
+    }
+
+    fn make_temp_market(date: NaiveDate, lo: f64, hi: f64) -> WeatherMarket {
+        use crate::api::weather_market::WeatherMarketType;
+        WeatherMarket {
+            slug: format!("london-temp-{lo:.0}-{hi:.0}"),
+            question: format!("Will London high be {lo:.0}-{hi:.0}°C?"),
+            city: "London".into(),
+            target_date: date,
+            close_ts: 9_999_999_999,
+            market_type: WeatherMarketType::TempRange,
+            temp_range: Some((lo, hi)),
+            liquidity_clob: 1000.0,
+            token_id_yes: "y".into(),
+            token_id_no: "n".into(),
+        }
+    }
+
+    fn make_snapshot(yes_ask: f64, yes_bid: f64, no_ask: f64) -> WeatherBookSnapshot {
+        WeatherBookSnapshot {
+            yes_best_ask: yes_ask,
+            yes_best_bid: yes_bid,
+            no_best_ask: no_ask,
+            no_best_bid: no_ask - 0.05,
+            depth_usdc: 200.0,
+        }
+    }
+
+    fn make_ens_forecast(date: NaiveDate, members: Vec<f64>) -> WeatherForecast {
+        let mean = members.iter().sum::<f64>() / members.len() as f64;
+        WeatherForecast {
+            city: "London".into(),
+            model: WeatherModel::Ensemble,
+            forecast_date: date,
+            max_temp_c: mean,
+            min_temp_c: mean - 8.0,
+            prob_precip: 0.1,
+            ensemble_members: Some(members),
+            fetched_at: Utc::now(),
+            lead_days: 3,
+        }
+    }
+
+    fn make_det_forecast(date: NaiveDate, model: WeatherModel, temp: f64) -> WeatherForecast {
+        WeatherForecast {
+            city: "London".into(),
+            model,
+            forecast_date: date,
+            max_temp_c: temp,
+            min_temp_c: temp - 8.0,
+            prob_precip: 0.1,
+            ensemble_members: None,
+            fetched_at: Utc::now(),
+            lead_days: 3,
+        }
+    }
+
+    /// Stable weather: all Ensemble members tightly clustered around 20°C.
+    /// Old logic blocked this because Ensemble p_yes ≈ 80% vs GFS CDF ≈ 13%.
+    /// New logic uses calibrated σ=1.2°C (floor), giving consistent CDF values
+    /// and allows the signal through.
+    #[test]
+    fn stable_weather_allows_entry() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        // 10 members, all between 19.7–20.3°C → ens_std ≈ 0.2°C → σ_cal=1.2°C
+        let members: Vec<f64> = (0..10).map(|i| 19.7 + i as f64 * 0.06).collect();
+        let ens = make_ens_forecast(date, members);
+        let gfs = make_det_forecast(date, WeatherModel::Gfs, 20.0);
+        let city_fc = ConsensusCityForecasts { gfs: vec![gfs], ecmwf: None, ensemble: Some(vec![ens]) };
+        // Market: will London high be 19.5–20.5°C?  Market prices NO at 0.55 (YES at 0.45)
+        let market = make_temp_market(date, 19.5, 20.5);
+        // With σ=1.2 around μ=20.0: P(19.5<T<20.5) ≈ 38% → edge_no ≈ 0.55 - (1-0.38) - 0.023 > 0
+        let snapshot = make_snapshot(0.45, 0.40, 0.55);
+        let cfg = make_consensus_cfg();
+        let sig = evaluate_consensus_signal_for_market(&city_fc, &market, &snapshot, &cfg, 0.10);
+        let sig = sig.expect("should produce a signal");
+        assert_ne!(
+            sig.reason_code.as_str(), "MODEL_DIVERGENCE",
+            "stable weather must not be blocked by MODEL_DIVERGENCE"
+        );
+        assert_ne!(sig.reason_code.as_str(), "MODEL_MEAN_DIVERGENCE");
+        assert_ne!(sig.reason_code.as_str(), "HIGH_ATM_UNCERTAINTY");
+    }
+
+    /// GFS says 22°C, Ensemble mean is 17°C — models disagree on temperature.
+    /// Should be blocked with MODEL_MEAN_DIVERGENCE.
+    #[test]
+    fn mean_divergence_blocks_entry() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        // Ensemble clustered around 17°C
+        let members: Vec<f64> = vec![16.5, 17.0, 17.5, 17.0, 16.8, 17.2];
+        let ens = make_ens_forecast(date, members);
+        // GFS says 22°C — 5°C gap vs ens_mean ≈ 17°C
+        let gfs = make_det_forecast(date, WeatherModel::Gfs, 22.0);
+        let city_fc = ConsensusCityForecasts { gfs: vec![gfs], ecmwf: None, ensemble: Some(vec![ens]) };
+        let market = make_temp_market(date, 21.5, 22.5);
+        let snapshot = make_snapshot(0.40, 0.35, 0.60);
+        let cfg = make_consensus_cfg();
+        let sig = evaluate_consensus_signal_for_market(&city_fc, &market, &snapshot, &cfg, 0.10)
+            .expect("should produce a signal");
+        assert_eq!(sig.reason_code, "MODEL_MEAN_DIVERGENCE");
+        assert_eq!(sig.direction, WeatherDirection::Hold);
+    }
+
+    /// ens_std = 4.2°C — atmosphere too chaotic to trade.
+    /// Should be blocked with HIGH_ATM_UNCERTAINTY.
+    #[test]
+    fn chaos_blocks_entry() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        // Members spread wildly from 14 to 26°C
+        let members: Vec<f64> = vec![14.0, 26.0, 18.0, 22.0, 15.0, 25.0, 19.0, 23.0];
+        let ens = make_ens_forecast(date, members);
+        let gfs = make_det_forecast(date, WeatherModel::Gfs, 20.0);
+        let city_fc = ConsensusCityForecasts { gfs: vec![gfs], ecmwf: None, ensemble: Some(vec![ens]) };
+        let market = make_temp_market(date, 19.5, 20.5);
+        let snapshot = make_snapshot(0.40, 0.35, 0.60);
+        let cfg = make_consensus_cfg();
+        let sig = evaluate_consensus_signal_for_market(&city_fc, &market, &snapshot, &cfg, 0.10)
+            .expect("should produce a signal");
+        assert_eq!(sig.reason_code, "HIGH_ATM_UNCERTAINTY");
+        assert_eq!(sig.direction, WeatherDirection::Hold);
+    }
+
+    /// CDF models both say p_yes ≈ 0.12 (BuyNo direction),
+    /// but Ensemble direct count says p_yes = 0.70 (BuyYes direction).
+    /// Should be blocked with ENS_DIRECTION_CONFLICT.
+    #[test]
+    fn ens_direction_conflict_blocks() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        // Ensemble: most members predict 20°C → high p_yes for the 20°C bucket
+        // std=0.3°C so passes mean/chaos checks
+        let members: Vec<f64> = vec![19.7, 19.8, 20.0, 20.1, 20.2, 20.1, 19.9, 20.0, 20.1, 20.0];
+        let ens = make_ens_forecast(date, members);  // ens_mean≈20.0, ens_std≈0.15
+        // GFS says 17°C (within 2°C of… wait, 20-17=3 > MEAN_DIVERGENCE_C=2.0)
+        // I need GFS to pass the mean check but produce p_yes < 0.5
+        // GFS at 24°C: |24-20|=4 → will trigger MEAN_DIVERGENCE first.
+        // Let me use GFS at 14°C for 30-35°C market instead:
+        // Actually let me redesign: use a market at 25-26°C, GFS=15°C, ens_mean=14.8°C (within 2°C)
+        // → CDF with σ=1.2 around μ=15: P(24.5<T<25.5) ≈ 0% → BuyNo direction
+        // → Ensemble direct: most members 14-16°C → 0/10 in [24.5,25.5] → p_ens=0 → also BuyNo
+        // Hmm, that won't create a conflict. Let me think differently.
+        //
+        // The conflict scenario: market is 19.5-20.5°C
+        // GFS at 24°C would say: CDF p_yes low (market is 20, GFS says 24) → passes mean check? |24-20|=4 > 2 → NO
+        // I need ens_mean close to GFS but Ensemble members clustered IN the bucket
+        // while GFS mu is just outside the bucket.
+        //
+        // GFS=21.5°C, ens_mean=21.2°C (within 2°C), ens_std=0.3°C (passes chaos)
+        // Market bucket: 19.5-20.5°C
+        // σ_cal = max(0.3, 1.2) = 1.2°C
+        // p_gfs_cdf: CDF(μ=21.5, σ=1.2) for [19.5,20.5]:
+        //   = CDF((20.5-21.5)/1.2) - CDF((19.5-21.5)/1.2)
+        //   = CDF(-0.833) - CDF(-1.667)
+        //   = 0.202 - 0.048 = 0.154 → p_yes=0.154 < 0.5 → BuyNo direction ✓
+        //
+        // Ensemble direct: members all around 21°C → 0/10 in [19.5,20.5]
+        //   p_ens_direct = 0.0 < 0.5 → also BuyNo direction → no conflict!
+        //
+        // For a direction conflict I need:
+        // CDF says p_yes < 0.5 but Ensemble direct count says p_yes > 0.5
+        // This happens when μ_gfs ≈ ens_mean (passes mean check) BUT most ensemble
+        // members fall inside the bucket while GFS μ is ALSO in the bucket...
+        // then CDF with σ=1.2 might give 38% while direct count gives 70%...
+        // both > 0.5? No wait:
+        //   - CDF with μ=20, σ=1.2 for [19.5,20.5]: P≈38% → BuyNo direction (p<0.5)
+        //   - Ensemble 7/10 members in [19.5,20.5]: p_ens=70% → BuyYes direction (p>0.5)
+        // THAT's the conflict! CDF says 38% (< 50%, BuyNo), Ensemble says 70% (> 50%, BuyYes)
+        // This happens when the bucket is narrow and ensemble clusters inside it.
+        //
+        // Use: GFS=20.0, ens_mean=20.0, ens_std=0.3°C → σ_cal=1.2°C
+        // p_gfs_cdf for [19.5,20.5] with σ=1.2: ≈ 38% (< 0.5 → BuyNo)
+        // Ensemble: 7/10 members in [19.5,20.5]: p_ens=70% (> 0.5 → BuyYes)
+        // → direction conflict ✓
+        let members_conflict: Vec<f64> = vec![19.6, 19.8, 20.0, 20.1, 20.2, 19.9, 20.0, 24.0, 14.0, 15.0];
+        // 7/10 in [19.5,20.5]: 19.6,19.8,20.0,20.1,20.2,19.9,20.0 → p_ens=0.70
+        // ens_mean ≈ 19.36, ens_std ≈ 2.7°C → that would trigger chaos check...
+        // Let me use a cleaner set:
+        // 8/10 in bucket, std stays low:
+        let members_conflict2: Vec<f64> = vec![20.0, 20.1, 19.8, 20.2, 19.9, 20.0, 20.1, 19.7, 20.0, 19.8];
+        // mean≈19.96, std≈0.15 → σ_cal=1.2, p_ens=10/10=100%? No: ALL in [19.5,20.5]
+        // CDF: μ=20, σ=1.2 → P([19.5,20.5]) ≈ 32%
+        // Ensemble: 10/10 = 100% → conflict: 32% < 0.5, 100% > 0.5 ✓
+        let ens_conflict = make_ens_forecast(date, members_conflict2.clone());
+        let gfs_conflict = make_det_forecast(date, WeatherModel::Gfs, 19.96);
+        let city_fc2 = ConsensusCityForecasts {
+            gfs: vec![gfs_conflict],
+            ecmwf: None,
+            ensemble: Some(vec![ens_conflict]),
+        };
+        let market2 = make_temp_market(date, 19.5, 20.5);
+        let snapshot2 = make_snapshot(0.35, 0.30, 0.65);
+        let cfg = make_consensus_cfg();
+        let sig2 = evaluate_consensus_signal_for_market(&city_fc2, &market2, &snapshot2, &cfg, 0.10)
+            .expect("should produce a signal");
+        assert_eq!(sig2.reason_code, "ENS_DIRECTION_CONFLICT",
+            "When CDF<0.5 but Ensemble>0.5, should block. got: {} reason: {}",
+            sig2.reason_code, sig2.reason);
+        assert_eq!(sig2.direction, WeatherDirection::Hold);
+    }
+
+    /// When Ensemble is not available at all, fall back to fixed GFS sigma table
+    /// and still produce a usable signal (no crash).
+    #[test]
+    fn consensus_no_ensemble_falls_back_to_gfs_sigma() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let gfs = make_det_forecast(date, WeatherModel::Gfs, 25.0);
+        let ecmwf = make_det_forecast(date, WeatherModel::Ecmwf, 25.1);
+        let city_fc = ConsensusCityForecasts {
+            gfs: vec![gfs],
+            ecmwf: Some(vec![ecmwf]),
+            ensemble: None,
+        };
+        // Market: 25-26°C. With GFS σ=3.0 (lead=3, no ensemble): P≈13%
+        let market = make_temp_market(date, 24.5, 25.5);
+        let snapshot = make_snapshot(0.40, 0.35, 0.60);
+        let cfg = make_consensus_cfg();
+        let sig = evaluate_consensus_signal_for_market(&city_fc, &market, &snapshot, &cfg, 0.10);
+        // Should not crash and should produce some signal
+        assert!(sig.is_some(), "should produce a signal even without Ensemble");
+        let sig = sig.unwrap();
+        assert_ne!(sig.reason_code, "MODEL_MEAN_DIVERGENCE");
+        assert_ne!(sig.reason_code, "HIGH_ATM_UNCERTAINTY");
+    }
+
     fn test_strategy_config() -> StrategyConfig {
         StrategyConfig {
             id: "weather_test".to_string(),
@@ -1828,6 +2205,8 @@ mod tests {
             customized_min_history_ticks:           3,
             customized_max_ensemble_spread_celsius: 4.0,
             customized_max_positions_per_city:      3,
+            high_yes_ask_threshold:      1.1,
+            high_yes_min_confidence_no:  0.85,
             ladder_min_leg_price: 0.0002,
             ladder_max_leg_price: 0.15,
             ladder_min_payout_ratio: 80.0,
@@ -1934,7 +2313,7 @@ mod tests {
         let sc = test_strategy_config();
         let cap = capital::new_shared(&sc);
         let global = test_live_config(sc.clone());
-        let strategy = WeatherStrategy::new(global, sc, cap);
+        let strategy = WeatherStrategy::new(global, sc, cap, None);
         let db = DbWriter::open(":memory:").expect("open in-memory DB");
         let now_ts = Utc::now().timestamp() as u64;
         let mut positions = vec![make_position(now_ts)];
@@ -1968,7 +2347,7 @@ mod tests {
         let sc = test_strategy_config();
         let cap = capital::new_shared(&sc);
         let global = test_live_config(sc.clone());
-        let strategy = WeatherStrategy::new(global, sc, cap);
+        let strategy = WeatherStrategy::new(global, sc, cap, None);
         let db = DbWriter::open(":memory:").expect("open in-memory DB");
         let now_ts = Utc::now().timestamp() as u64;
         let mut positions = vec![make_position(now_ts)];

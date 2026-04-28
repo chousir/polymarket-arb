@@ -167,6 +167,9 @@ impl MentionStrategy {
                         reason_code:              "TIME_EXIT".to_string(),
                         note:                     None,
                     }).await;
+                } else if let Err(e) = self.submit_live_exit(pos, pos.entry_price, db, "TIME_EXIT").await {
+                    tracing::warn!("[Mention:{}] TIME_EXIT live 失敗，延後: {e}", self.sc.id);
+                    continue;
                 }
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), None, pos.size_usdc,
@@ -223,6 +226,9 @@ impl MentionStrategy {
                         reason_code:            "TAKE_PROFIT".to_string(),
                         note:                   None,
                     }).await;
+                } else if let Err(e) = self.submit_live_exit(pos, exit_price, db, "TAKE_PROFIT").await {
+                    tracing::warn!("[Mention:{}] TAKE_PROFIT live 失敗，延後: {e}", self.sc.id);
+                    continue;
                 }
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
@@ -268,6 +274,9 @@ impl MentionStrategy {
                         reason_code:            "STOP_LOSS".to_string(),
                         note:                   None,
                     }).await;
+                } else if let Err(e) = self.submit_live_exit(pos, exit_price, db, "STOP_LOSS").await {
+                    tracing::warn!("[Mention:{}] STOP_LOSS live 失敗，延後: {e}", self.sc.id);
+                    continue;
                 }
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                     .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
@@ -577,6 +586,40 @@ impl MentionStrategy {
             bet_size_usdc:        bet_size,
             max_spread:           self.sc.max_spread,
         }
+    }
+}
+
+// ── Live exit helper ─────────────────────────────────────────────────────────
+
+impl MentionStrategy {
+    async fn submit_live_exit(
+        &self,
+        pos: &OpenPosition,
+        exit_price: f64,
+        db: &DbWriter,
+        action: &str,
+    ) -> Result<(), crate::error::AppError> {
+        let fee_usdc = self.global.compute_fee(pos.size_usdc);
+        let intent = crate::execution::executor::OrderIntent {
+            strategy_id:     self.sc.id.clone(),
+            market_slug:     pos.market_slug.clone(),
+            token_id:        pos.token_id.clone(),
+            side:            "SELL".to_string(),
+            price:           exit_price,
+            size_usdc:       pos.size_usdc,
+            fee_usdc,
+            leg:             2,
+            signal_dump_pct: None,
+            hedge_sum:       None,
+        };
+        let result = crate::execution::executor::submit_order(
+            &intent, &self.global, db, &self.capital,
+        ).await?;
+        tracing::info!(
+            "[Mention:{}] LIVE {} 已送出平倉單 slug={} price={:.4} result={:?}",
+            self.sc.id, action, pos.market_slug, exit_price, result
+        );
+        Ok(())
     }
 }
 

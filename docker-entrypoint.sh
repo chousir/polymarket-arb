@@ -56,25 +56,31 @@ run_dashboard() {
         --log-level info
 }
 
-# ── 兩個進程並行（背景啟動一個，前景跑另一個） ───────────────────────────────
+# ── 兩個進程並行，任一死亡則整體退出 ────────────────────────────────────────
 run_both() {
-    echo "[docker-entrypoint] 啟動 Rust 引擎（背景）+ Python 儀表板（前景）..."
-    
+    echo "[docker-entrypoint] 啟動 Rust 引擎 + Python 儀表板..."
+
     /app/bin/polymarket-engine \
         $([ "$TRADING_MODE" = "live" ] && echo "--mode live --confirm-live" || echo "--mode dry_run") \
         &
     ENGINE_PID=$!
-    
-    # 等待引擎初始化
+
     sleep 3
-    
-    # 前景啟動 Dashboard
+
     cd /app/python-analytics
-    trap "kill $ENGINE_PID" EXIT
-    exec uvicorn src.dashboard.app:app \
+    uvicorn src.dashboard.app:app \
         --host 0.0.0.0 \
         --port 8080 \
-        --log-level info
+        --log-level info &
+    DASHBOARD_PID=$!
+
+    # 收到 TERM/INT 時同時殺掉兩個子進程
+    trap "kill $ENGINE_PID $DASHBOARD_PID 2>/dev/null" TERM INT EXIT
+
+    # 任一子進程退出，立即終止另一個並退出
+    wait -n $ENGINE_PID $DASHBOARD_PID
+    kill $ENGINE_PID $DASHBOARD_PID 2>/dev/null
+    wait
 }
 
 # ── 啟動邏輯 ──────────────────────────────────────────────────────────────

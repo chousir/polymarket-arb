@@ -3,8 +3,6 @@
 # 複製此檔為 docker-compose.override.yml，自動被 docker-compose 載入
 # 用於開發環境調整（更高的日誌等級、volume mount 等）
 
-version: '3.8'
-
 services:
   app:
     # 本機開發掛載原始碼（允許 cargo watch / uvicorn reload）

@@ -284,10 +284,11 @@ async fn main() -> Result<(), AppError> {
                 .map(Arc::clone)
                 .expect("capital tracker missing for weather strategy");
             let db = db.clone();
+            let tg = telegram.clone();
 
             tracing::info!("[Weather:{}] 啟動背景掃描任務", sc.id);
             tokio::spawn(async move {
-                strategy::weather_executor::WeatherStrategy::new(global, sc, cap)
+                strategy::weather_executor::WeatherStrategy::new(global, sc, cap, tg)
                     .run_loop(&db)
                     .await;
             });
@@ -336,10 +337,11 @@ async fn main() -> Result<(), AppError> {
                 .map(Arc::clone)
                 .expect("capital tracker missing for weather customized strategy");
             let db = db.clone();
+            let tg = telegram.clone();
 
             tracing::info!("[Customized:{}] 啟動背景掃描任務", sc.id);
             tokio::spawn(async move {
-                strategy::weather_customized_executor::WeatherCustomizedStrategy::new(global, sc, cap)
+                strategy::weather_customized_executor::WeatherCustomizedStrategy::new(global, sc, cap, tg)
                     .run_loop(&db)
                     .await;
             });

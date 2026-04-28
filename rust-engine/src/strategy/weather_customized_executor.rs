@@ -41,6 +41,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
 use crate::api::weather::{city_info, WeatherForecast, WeatherModel};
+use crate::api::weather::metar;
 use crate::api::weather_market::{fetch_weather_markets, WeatherMarket};
 use crate::api::clob;
 use crate::api::gamma;
@@ -48,6 +49,7 @@ use crate::config::{BotConfig, StrategyConfig};
 use crate::db::writer::{DbWriter, WeatherDryRunTrade};
 use crate::error::AppError;
 use crate::execution::executor;
+use crate::notify::telegram::Notifier;
 use crate::risk::capital::SharedCapital;
 use crate::strategy::weather_decision::{
     self, WeatherBookSnapshot, WeatherDecisionConfig, WeatherDirection,
@@ -102,14 +104,21 @@ struct WeatherCustomPosition {
 // ── Public strategy struct ────────────────────────────────────────────────────
 
 pub struct WeatherCustomizedStrategy {
-    global: BotConfig,
-    sc:     StrategyConfig,
-    capital: SharedCapital,
+    global:   BotConfig,
+    sc:       StrategyConfig,
+    capital:  SharedCapital,
+    notifier: Option<Notifier>,
 }
 
 impl WeatherCustomizedStrategy {
-    pub fn new(global: BotConfig, sc: StrategyConfig, capital: SharedCapital) -> Self {
-        Self { global, sc, capital }
+    pub fn new(global: BotConfig, sc: StrategyConfig, capital: SharedCapital, notifier: Option<Notifier>) -> Self {
+        Self { global, sc, capital, notifier }
+    }
+
+    async fn tg(&self, emoji: &str, title: &str, detail: &str) {
+        if let Some(n) = &self.notifier {
+            n.notify_alert(emoji, title, detail).await;
+        }
     }
 
     pub async fn run_loop(&self, db: &DbWriter) {
@@ -159,29 +168,56 @@ impl WeatherCustomizedStrategy {
                 // TIME_DECAY_EXIT: first try settlement, then market-price exit
                 if Instant::now() >= pos.abort_at {
                     let hold_sec = now_ts as i64 - pos.entry_ts;
-                    match gamma::fetch_token_settlement_price(&pos.market_slug, &pos.token_id).await {
-                        Ok(Some(settled_price)) => {
-                            let pnl = (settled_price - pos.entry_price) * pos.size_usdc
-                                - self.global.compute_fee(pos.size_usdc) * 2.0;
-                            tracing::info!(
-                                "[Custom:{}] SETTLEMENT {} side={} settled={:.2} hold={}s pnl={:.4}",
-                                self.sc.id, pos.market_slug, pos.side, settled_price, hold_sec, pnl
-                            );
-                            self.write_exit(db, pos, "SETTLEMENT", settled_price, hold_sec, pnl, None).await;
-                            self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                                .on_cycle_end(Some(pos.entry_price), Some(settled_price), pos.size_usdc,
-                                              self.global.compute_fee(pos.size_usdc));
-                            newly_exited.push(pos.market_slug.clone());
-                            to_remove.push(idx);
-                            continue;
+
+                    // Fetch settlement; if not ready, retry up to 3 × 60 s before giving up
+                    let settled_price: Option<f64> = match gamma::fetch_token_settlement_price(&pos.market_slug, &pos.token_id).await {
+                        Ok(Some(p)) => Some(p),
+                        Ok(None) => {
+                            let mut found = None;
+                            for attempt in 1..=3u8 {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                match gamma::fetch_token_settlement_price(&pos.market_slug, &pos.token_id).await {
+                                    Ok(Some(p)) => { found = Some(p); break; }
+                                    Ok(None) => tracing::warn!(
+                                        "[Custom:{}] 結算尚未就緒 {} attempt={}/3",
+                                        self.sc.id, pos.market_slug, attempt
+                                    ),
+                                    Err(e) => { tracing::warn!("[Custom:{}] 結算重試失敗: {e}", self.sc.id); break; }
+                                }
+                            }
+                            found
                         }
-                        Ok(None) => {}
                         Err(e) => {
                             tracing::warn!(
                                 "[Custom:{}] 結算查詢失敗 {}，降級 TIME_DECAY_EXIT: {e}",
                                 self.sc.id, pos.market_slug
                             );
+                            None
                         }
+                    };
+
+                    if let Some(settled_price) = settled_price {
+                        let pnl = (settled_price - pos.entry_price) * pos.size_usdc
+                            - self.global.compute_fee(pos.size_usdc) * 2.0;
+                        tracing::info!(
+                            "[Custom:{}] SETTLEMENT {} side={} settled={:.2} hold={}s pnl={:.4}",
+                            self.sc.id, pos.market_slug, pos.side, settled_price, hold_sec, pnl
+                        );
+                        self.write_exit(db, pos, "SETTLEMENT", settled_price, hold_sec, pnl, None).await;
+                        if self.global.is_dry_run() {
+                            self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                                .on_weather_exit(pos.size_usdc, pnl);
+                        } else {
+                            self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                                .on_cycle_end(Some(pos.entry_price), Some(settled_price), pos.size_usdc,
+                                              self.global.compute_fee(pos.size_usdc));
+                        }
+                        self.tg("💰", "SETTLEMENT",
+                            &format!("{} side={} settled={:.4} pnl={:+.4} USDC",
+                                pos.market_slug, pos.side, settled_price, pnl)).await;
+                        newly_exited.push(pos.market_slug.clone());
+                        to_remove.push(idx);
+                        continue;
                     }
 
                     let pnl = -self.global.compute_fee(pos.size_usdc);
@@ -189,11 +225,13 @@ impl WeatherCustomizedStrategy {
                         "[Custom:{}] TIME_DECAY_EXIT {} secs_left={} hold={}s",
                         self.sc.id, pos.market_slug, secs_to_close, hold_sec
                     );
+                    self.tg("⏰", "TIME_DECAY_EXIT",
+                        &format!("{} side={} hold={}s pnl={:+.4} USDC",
+                            pos.market_slug, pos.side, hold_sec, pnl)).await;
                     if self.global.is_dry_run() {
                         self.write_exit(db, pos, "TIME_DECAY_EXIT", pos.entry_price, hold_sec, pnl, None).await;
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), None, pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, pnl);
                     } else {
                         let book = match clob::fetch_order_book(&self.global.clob_base, &pos.token_id).await {
                             Ok(b) => b,
@@ -224,6 +262,9 @@ impl WeatherCustomizedStrategy {
                     }
                 };
 
+                // Compute lead days once — used by FORECAST_SHIFT (before SL) and STOP_LOSS.
+                let current_lead_days = (pos.market.target_date - Utc::now().date_naive()).num_days();
+
                 // TAKE_PROFIT: trailing high-watermark with break-even guard
                 pos.bid_best = pos.bid_best.max(book.best_bid);
                 let effective_gap = pos.profit_target
@@ -252,62 +293,28 @@ impl WeatherCustomizedStrategy {
                     );
                     if self.global.is_dry_run() {
                         self.write_exit(db, pos, "TAKE_PROFIT", exit_price, hold_sec, pnl, None).await;
-                    } else if let Err(e) = self.submit_live_exit(pos, exit_price, db, "TAKE_PROFIT").await {
-                        tracing::warn!("[Custom:{}] TAKE_PROFIT live 失敗: {e}", self.sc.id);
-                        continue;
+                        self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                            .on_weather_exit(pos.size_usdc, pnl);
+                    } else {
+                        if let Err(e) = self.submit_live_exit(pos, exit_price, db, "TAKE_PROFIT").await {
+                            tracing::warn!("[Custom:{}] TAKE_PROFIT live 失敗: {e}", self.sc.id);
+                            continue;
+                        }
+                        self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                            .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
+                                          self.global.compute_fee(pos.size_usdc));
                     }
-                    self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                        .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                      self.global.compute_fee(pos.size_usdc));
+                    self.tg("💚", "TAKE_PROFIT",
+                        &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
+                            pos.market_slug, pos.side, exit_price, pnl)).await;
                     newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
                     continue;
                 }
 
-                // STOP_LOSS: trailing with tick filter
-                let current_lead_days = (pos.market.target_date - Utc::now().date_naive()).num_days();
-                let sl_delta = if current_lead_days >= 1 {
-                    self.sc.stop_loss_delta * 2.0
-                } else {
-                    self.sc.stop_loss_delta
-                };
-                let effective_sl = pos.stop_loss_price.max(pos.bid_best - sl_delta);
-                if book.best_ask <= effective_sl {
-                    pos.consecutive_sl_ticks += 1;
-                    tracing::debug!(
-                        "[Custom:{}] STOP_LOSS 候選 {} ask={:.4} floor={:.4} ticks={}/{}",
-                        self.sc.id, pos.market_slug,
-                        book.best_ask, effective_sl,
-                        pos.consecutive_sl_ticks, self.sc.min_sl_ticks
-                    );
-                    if pos.consecutive_sl_ticks < self.sc.min_sl_ticks {
-                        continue;
-                    }
-                    let hold_sec = now_ts as i64 - pos.entry_ts;
-                    let exit_price = book.best_bid;
-                    let pnl = (exit_price - pos.entry_price) * pos.size_usdc
-                        - self.global.compute_fee(pos.size_usdc) * 2.0;
-                    tracing::info!(
-                        "[Custom:{}] STOP_LOSS {} side={} ask={:.4} floor={:.4} pnl={:.4}",
-                        self.sc.id, pos.market_slug, pos.side, book.best_ask, effective_sl, pnl
-                    );
-                    if self.global.is_dry_run() {
-                        self.write_exit(db, pos, "STOP_LOSS", exit_price, hold_sec, pnl, None).await;
-                    } else if let Err(e) = self.submit_live_exit(pos, exit_price, db, "STOP_LOSS").await {
-                        tracing::warn!("[Custom:{}] STOP_LOSS live 失敗: {e}", self.sc.id);
-                        continue;
-                    }
-                    self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                        .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                      self.global.compute_fee(pos.size_usdc));
-                    newly_exited.push(pos.market_slug.clone());
-                    to_remove.push(idx);
-                    continue;
-                } else {
-                    pos.consecutive_sl_ticks = 0;
-                }
-
-                // FORECAST_SHIFT: model p_yes flipped since entry
+                // FORECAST_SHIFT: model p_yes flipped since entry.
+                // Runs BEFORE STOP_LOSS so a fresh METAR signal (lead_days=0) can exit
+                // at a better bid price before the ask hits the SL floor.
                 let decision_cfg = self.make_decision_cfg(self.sc.weather_min_depth_usdc * 0.5, &pos.market.city);
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let opposite_token = if pos.side == "YES" {
@@ -332,11 +339,36 @@ impl WeatherCustomizedStrategy {
                 };
 
                 let forecast_days = self.sc.weather_max_lead_days + FORECAST_LEAD_BUFFER;
-                let city_info = city_info(&pos.market.city);
-                let fresh_forecasts = if let Some(ci) = city_info {
-                    fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days)
-                        .await
-                        .unwrap_or_default()
+                let city_ci = city_info(&pos.market.city);
+                let fresh_forecasts = if let Some(ci) = city_ci {
+                    if current_lead_days == 0 {
+                        // Target day has arrived: use real-time METAR observation instead of
+                        // a stale overnight Ensemble run.  MetarShort CDF (σ=2.5°C) is used
+                        // so the decision layer can evaluate whether the current temperature
+                        // already makes the NO outcome improbable.
+                        match metar::fetch_metar(ci, 2).await {
+                            Ok(obs) => {
+                                tracing::debug!(
+                                    "[Custom:{}] {} METAR 觀測 {:.1}°C，用於當日 FORECAST_SHIFT",
+                                    self.sc.id, pos.market.city, obs.max_temp_c
+                                );
+                                vec![WeatherForecast { model: WeatherModel::MetarShort, ..obs }]
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "[Custom:{}] {} METAR 失敗，回退 Ensemble: {e}",
+                                    self.sc.id, pos.market.city
+                                );
+                                fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days)
+                                    .await
+                                    .unwrap_or_default()
+                            }
+                        }
+                    } else {
+                        fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days)
+                            .await
+                            .unwrap_or_default()
+                    }
                 } else {
                     vec![]
                 };
@@ -368,16 +400,70 @@ impl WeatherCustomizedStrategy {
                                 db, pos, "FORECAST_SHIFT", exit_price, hold_sec,
                                 pnl, Some(fresh_signal.p_yes),
                             ).await;
-                        } else if let Err(e) = self.submit_live_exit(pos, exit_price, db, "FORECAST_SHIFT").await {
-                            tracing::warn!("[Custom:{}] FORECAST_SHIFT live 失敗: {e}", self.sc.id);
+                            self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                                .on_weather_exit(pos.size_usdc, pnl);
+                        } else {
+                            if let Err(e) = self.submit_live_exit(pos, exit_price, db, "FORECAST_SHIFT").await {
+                                tracing::warn!("[Custom:{}] FORECAST_SHIFT live 失敗: {e}", self.sc.id);
+                                continue;
+                            }
+                            self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                                .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
+                                              self.global.compute_fee(pos.size_usdc));
+                        }
+                        newly_exited.push(pos.market_slug.clone());
+                        to_remove.push(idx);
+                        continue;
+                    }
+                }
+
+                // STOP_LOSS: trailing with tick filter (current_lead_days already computed above)
+                let sl_delta = if current_lead_days >= 1 {
+                    self.sc.stop_loss_delta * 2.0
+                } else {
+                    self.sc.stop_loss_delta
+                };
+                let effective_sl = pos.stop_loss_price.max(pos.bid_best - sl_delta);
+                if book.best_ask <= effective_sl {
+                    pos.consecutive_sl_ticks += 1;
+                    tracing::debug!(
+                        "[Custom:{}] STOP_LOSS 候選 {} ask={:.4} floor={:.4} ticks={}/{}",
+                        self.sc.id, pos.market_slug,
+                        book.best_ask, effective_sl,
+                        pos.consecutive_sl_ticks, self.sc.min_sl_ticks
+                    );
+                    if pos.consecutive_sl_ticks < self.sc.min_sl_ticks {
+                        continue;
+                    }
+                    let hold_sec = now_ts as i64 - pos.entry_ts;
+                    let exit_price = book.best_bid;
+                    let pnl = (exit_price - pos.entry_price) * pos.size_usdc
+                        - self.global.compute_fee(pos.size_usdc) * 2.0;
+                    tracing::info!(
+                        "[Custom:{}] STOP_LOSS {} side={} ask={:.4} floor={:.4} pnl={:.4}",
+                        self.sc.id, pos.market_slug, pos.side, book.best_ask, effective_sl, pnl
+                    );
+                    if self.global.is_dry_run() {
+                        self.write_exit(db, pos, "STOP_LOSS", exit_price, hold_sec, pnl, None).await;
+                        self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                            .on_weather_exit(pos.size_usdc, pnl);
+                    } else {
+                        if let Err(e) = self.submit_live_exit(pos, exit_price, db, "STOP_LOSS").await {
+                            tracing::warn!("[Custom:{}] STOP_LOSS live 失敗: {e}", self.sc.id);
                             continue;
                         }
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
                             .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
                                           self.global.compute_fee(pos.size_usdc));
-                        newly_exited.push(pos.market_slug.clone());
-                        to_remove.push(idx);
                     }
+                    self.tg("🔴", "STOP_LOSS",
+                        &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
+                            pos.market_slug, pos.side, exit_price, pnl)).await;
+                    newly_exited.push(pos.market_slug.clone());
+                    to_remove.push(idx);
+                    continue;
+                } else {
+                    pos.consecutive_sl_ticks = 0;
                 }
             }
 
@@ -447,6 +533,25 @@ impl WeatherCustomizedStrategy {
 
         if by_city.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Peak Bucket Block: for each city+date group find the single market with the
+        // highest CLOB liquidity — that is the bucket the crowd is most focused on.
+        // We refuse BuyNo on it because the market's "favourite temperature" already
+        // embodies strong consensus; betting against it is high-risk/low-reward.
+        let mut peak_no_slugs: HashSet<String> = HashSet::new();
+        for city_markets in by_city.values() {
+            let mut date_peaks: std::collections::HashMap<chrono::NaiveDate, &WeatherMarket> =
+                std::collections::HashMap::new();
+            for market in city_markets {
+                let entry = date_peaks.entry(market.target_date).or_insert(market);
+                if market.liquidity_clob > entry.liquidity_clob {
+                    *entry = market;
+                }
+            }
+            for peak_market in date_peaks.into_values() {
+                peak_no_slugs.insert(peak_market.slug.clone());
+            }
         }
 
         let forecast_days = self.sc.weather_max_lead_days + FORECAST_LEAD_BUFFER;
@@ -547,6 +652,17 @@ impl WeatherCustomizedStrategy {
                     continue;
                 }
 
+                // ── Peak Bucket Block ─────────────────────────────────────────
+                if signal.direction == WeatherDirection::BuyNo
+                    && peak_no_slugs.contains(&market.slug)
+                {
+                    tracing::debug!(
+                        "[Custom:{}] {} 為城市最高流動性桶，跳過 BuyNo（峰值桶保護）",
+                        self.sc.id, market.slug
+                    );
+                    continue;
+                }
+
                 // ── Gate 2/3 (ENTRY_PRICE range) ─────────────────────────────
                 let entry_ask = match signal.direction {
                     WeatherDirection::BuyYes => snap.yes_best_ask,
@@ -631,6 +747,9 @@ impl WeatherCustomizedStrategy {
                     self.sc.id, market.slug, side, entry_ask,
                     signal.p_yes, signal.edge_bps, lead_days
                 );
+                self.tg("📥", "ENTRY",
+                    &format!("{} side={} ask={:.4} edge={:.0}bps lead={}d",
+                        market.slug, side, entry_ask, signal.edge_bps, lead_days)).await;
 
                 if self.global.is_dry_run() {
                     let event_id = format!("{}-{}-{}",
@@ -684,6 +803,11 @@ impl WeatherCustomizedStrategy {
                         expected_net_edge_bps: signal.edge_bps,
                         consecutive_sl_ticks:  0,
                     });
+                    // Lock capital immediately so subsequent positions in the same scan
+                    // cycle use a reduced bet_size rather than the pre-open snapshot.
+                    self.capital.lock()
+                        .unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
+                        .on_weather_entry(bet_size);
                 } else {
                     // Live mode
                     let fee_usdc = self.global.compute_fee(bet_size);
@@ -753,6 +877,8 @@ impl WeatherCustomizedStrategy {
             bet_size_usdc:                  bet_size,
             city_sigma_mult:                self.global.city_sigma_mult(city),
             forecast_temp_bias_celsius:     self.sc.forecast_temp_bias_celsius,
+            high_yes_ask_threshold:         self.sc.high_yes_ask_threshold,
+            high_yes_min_confidence_no:     self.sc.high_yes_min_confidence_no,
         }
     }
 

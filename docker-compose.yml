@@ -18,6 +18,7 @@ services:
       CLOB_API_SECRET: ${CLOB_API_SECRET:-}
       CLOB_API_PASSPHRASE: ${CLOB_API_PASSPHRASE:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       CONFIRM_LIVE: ${CONFIRM_LIVE:-}
 
     volumes:
@@ -28,6 +29,14 @@ services:
       - polymarket-net
 
     restart: on-failure:5
+
+    # engine-only 模式無 uvicorn，改用 pgrep 確認進程存活
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "polymarket-engine"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
     profiles:
       - engine
@@ -79,6 +88,7 @@ services:
       CLOB_API_SECRET: ${CLOB_API_SECRET:-}
       CLOB_API_PASSPHRASE: ${CLOB_API_PASSPHRASE:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       CONFIRM_LIVE: ${CONFIRM_LIVE:-}
 
     volumes:
@@ -100,6 +110,3 @@ networks:
   polymarket-net:
     driver: bridge
 
-volumes:
-  polymarket-data:
-    driver: local

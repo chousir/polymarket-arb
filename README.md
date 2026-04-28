@@ -278,7 +278,7 @@ effective_gap = min(profit_target, (1 - bid_best) × 2), 最小值 2¢
 | `min_temprange_p_yes` | 確定性模型 TempRange BUY_YES 門檻（1°C 帶上限 ≈ 0.26） |
 | `min_model_confidence_temprange` | TempRange BUY_NO 最低信心門檻（1-p_yes 需達此值） |
 | `forecast_temp_bias_celsius` | 模型溫度預測的加法修正量（預設 0.0）。ECMWF/GFS 系統性低估時設正值（例 +2.0）；只影響 CDF 型模型，Ensemble 直接計票不受影響 |
-| `consensus_max_divergence` | Consensus 策略三模型最大分歧（超過則不進場） |
+| `consensus_max_divergence` | Consensus 策略 CDF 模型間最大分歧（GFS vs ECMWF，σ 校正後互比，超過則不進場） |
 | `weather_min_lead_days` / `weather_max_lead_days` | 允許交易的預測天數範圍 |
 
 ### 已知問題與修復記錄
@@ -327,6 +327,85 @@ TP 只能保證「bid 低於 floor 時點火」，無法保證「填單價 ≥ f
 `if exit_price < entry_price + 2 × taker_fee_pct → 暫不平倉，交給下一個 tick 的 STOP_LOSS`。
 避免以虧損出場卻標記為 TAKE_PROFIT，同時避免提前鎖定本可回升的損失。
 
+#### P1-A：相鄰溫度桶相關性風險（2026-04-27 改善）
+
+**根因**：同一城市同一天的所有溫度桶只有一個會 YES 結算，其餘全部 NO。
+當策略同時在相鄰兩個桶（如 20°C、21°C）各持 NO 部位時，
+兩個賭注是強相關的——若實際溫度恰好落在其中一個桶，必定一輸一贏：
+
+```
+實際溫度 = 21°C：20°C NO 贏（+5.99），21°C NO 輸（-44.01），淨值 = -38.02
+```
+
+**改善**：新增**峰值桶保護閘門（Gate 6）**。
+進場前對每個城市+日期組，找出 CLOB 流動性最高的市場（「峰值桶」），
+禁止在該桶押 NO。流動性最高的桶 ≈ 市場資金最集中的桶 ≈ 群眾最確信的溫度，
+逆此方向下 NO 的風險/報酬最差。其餘桶的 NO 仍可正常進場。
+
+#### P1-B：逆高 YES 市場信心門檻不足（2026-04-27 改善）
+
+**根因**：BuyNo 的模型信心門檻固定為 70%，不論市場 YES 定價高低。
+當市場已將某桶 YES 定為 50%（代表大量資金押注此結果），
+模型只需 75% 確信即可進場，未能充分考慮市場的信息量。
+
+**改善**：新增**高 YES 動態信心閘門（Gate 7）**。
+當 `yes_best_ask >= high_yes_ask_threshold`（預設 0.35），
+BuyNo 所需的最低 (1-p_yes) 提升至 `high_yes_min_confidence_no`（預設 0.85）。
+
+```
+21°C YES=50% 案例：
+  市場：YES ask = 0.50 ≥ 0.35（觸發高門檻）
+  模型：p_yes = 0.25，(1-0.25) = 0.75 < 0.85 → 閘門阻擋，不進場
+```
+
+#### P1-C：Consensus 策略三模型 p_yes 不可直接比較（2026-04-28 修復）
+
+**根因**：舊邏輯直接比較 GFS CDF 機率、ECMWF CDF 機率、Ensemble 直接計票機率，
+以 `max - min > consensus_max_divergence` 決定是否阻擋。三者的計算機制根本不同：
+
+- **GFS / ECMWF**：單點預測 + 固定 σ 表（lead=2-4天 σ=3.0/2.5°C）→ 正態 CDF
+- **Ensemble**：30 個成員直接計票 → 落在 1°C 桶的比例
+
+固定 σ 不隨天氣狀況調整，導致兩種系統性錯誤：
+
+```
+穩定天氣（ens_std=0.7°C）：Ensemble 計票 80%，CDF 固定 σ=3.0 算出 13% → 差 67% → 誤擋
+混亂天氣（ens_std=3.5°C）：Ensemble 計票 7%，CDF 算出 13% → 差僅 6% → 誤放行
+```
+
+穩定天氣（預測最可靠）反而被阻擋；混亂天氣反而被放行——邏輯倒置。
+
+**修復**：三步驟分層判斷，不再直接比較 p_yes 數值：
+
+1. **均值一致性檢查**（`MODEL_MEAN_DIVERGENCE`）  
+   `|μ_gfs - ens_mean| > 2.0°C` 或 `|μ_ecmwf - ens_mean| > 2.0°C` → 阻擋  
+   原理：模型對「今天溫度大概幾度」的估計本身有根本分歧 → 真正不確定
+
+2. **大氣混亂度檢查**（`HIGH_ATM_UNCERTAINTY`）  
+   `ens_std > 3.5°C` → 阻擋  
+   原理：Ensemble 30 個成員標準差 > 3.5°C = 大氣確實混亂不可預測
+
+3. **σ 校正後的 CDF-to-CDF 比較**（`MODEL_DIVERGENCE`）  
+   `σ_calibrated = max(ens_std, 1.2°C) × city_sigma_mult`  
+   GFS 和 ECMWF 均改用此 σ 計算 p_yes，再互相比較  
+   原理：兩個 CDF 值用同一 σ → 殘差只剩 μ 差異 → 才是真正可比的「預測分歧」
+
+4. **Ensemble 方向驗證**（`ENS_DIRECTION_CONFLICT`）  
+   CDF 平均 p_yes 與 Ensemble 計票 p_yes 落在 0.5 的不同側 → 阻擋  
+   原理：方向相反代表兩種方法對「YES 是否比 NO 更可能」結論相反  
+   不做數值比較（兩者單位不同），只做方向比對
+
+```
+穩定天氣修復後（ens_std=0.7°C → σ_cal=1.2°C）：
+  CDF_gfs = CDF(μ=20.0, σ=1.2) for [19.5,20.5] ≈ 38%
+  CDF_ecmwf = CDF(μ=20.1, σ=1.2) for [19.5,20.5] ≈ 36%
+  divergence = 2% < 10% → 允許進場 ✓
+  Ensemble 方向=BuyNo(計票100%)，CDF 方向=BuyNo(38%<50%) → 方向一致 ✓
+```
+
+**新增 API**：`WeatherForecast::ensemble_mean_std() -> Option<(f64, f64)>`、
+`weather_decision::probability_yes_sigma(forecast, market, sigma, bias) -> Option<f64>`
+
 #### P1：STOP_LOSS 被薄流動性市場單 tick 噪音誤觸
 
 **根因**：氣象市場流動性低，一筆 $200-500 訂單即可使 best_ask 短暫跳動 20-30¢，
@@ -340,112 +419,256 @@ TP 只能保證「bid 低於 floor 時點火」，無法保證「填單價 ≥ f
 
 ---
 
-## Weather Customized 策略說明
+## weather_custom_verify 詳細流程
 
-`WeatherCustomized` 是在 `WeatherStrategy`（Ensemble 模型）基礎上加裝五道額外進場閘門的穩健版天氣策略。
-它使用與 `weather_ensemble_prob` 完全相同的 Ensemble 計票邏輯決定方向，但在入場前必須通過所有閘門。
+`weather_custom_verify` 是 `weather_customized` 類型的驗證實例（灰度，5% 資金）。
+每 15 分鐘掃描一次倫敦、NYC、東京、邁阿密、芝加哥的溫度市場，
+使用 GFS Ensemble（30 成員直接計票）評估機率，通過 7 道閘門後才入場。
 
-### 交易流程
+---
 
-```
-每隔 loop_interval_sec（預設 900 秒）
-│
-├─ 1. 拉取所有活躍天氣市場（fetch_weather_markets）
-│
-├─ 2. 更新每個市場的報價歷史（price_history: HashMap<slug, VecDeque<PriceTick>>）
-│     - 保留最近 customized_lookback_ticks 筆（預設 4 tick ≈ 60 分鐘）
-│     - YES ask / NO ask 分別記錄
-│
-├─ 3. 監控現有持倉（若有）
-│     ├─ SETTLEMENT：市場已到期時先查 UMA oracle 結算價
-│     │    - 取得 1.0 / 0.0 → 以真實結算 PnL 記帳，移除持倉
-│     │    - 未結算 → 降級 TIME_DECAY_EXIT（以市場中間價估算）
-│     ├─ TAKE_PROFIT：bid ≥ trailing_floor，且 exit > entry + 2×fee
-│     ├─ STOP_LOSS：ask ≤ effective_sl 連續 min_sl_ticks tick 才執行
-│     └─ FORECAST_SHIFT：Ensemble 預測轉向，p_yes 偏移超過門檻
-│
-└─ 4. 掃描新進場（scan_for_entries）
-      ├─ [基礎閘門] Ensemble 信心 / edge / 價差 / 深度
-      │    （與 WeatherStrategy 相同）
-      │
-      ├─ [閘門 1] LOOKBACK_SLOPE
-      │    - 取最近 customized_lookback_ticks 筆歷史，計算線性斜率（上升/tick）
-      │    - 斜率 ≥ customized_min_slope（預設 0.0 = 不下跌即可）才通過
-      │    - 歷史不足 customized_min_history_ticks（預設 3）時略過此閘門
-      │
-      ├─ [閘門 2] MIN_ENTRY_PRICE
-      │    - token ask ≥ customized_min_entry_price（預設 0.30）
-      │    - 過濾接近 0 的廉價 token（流動性差、風險/報酬失衡）
-      │
-      ├─ [閘門 3] MAX_ENTRY_PRICE
-      │    - token ask ≤ customized_max_entry_price（預設 0.85）
-      │    - 避免入場高價 token（費用侵蝕全部獲利空間）
-      │
-      ├─ [閘門 4] ENSEMBLE_SPREAD
-      │    - 所有 Ensemble 成員的溫度標準差 ≤ customized_max_ensemble_spread_celsius（預設 4.0 °C）
-      │    - 模型分歧過大代表預報不確定性高 → 跳過
-      │
-      └─ [閘門 5] CITY_EXPOSURE
-           - 同一城市的現有持倉數 < customized_max_positions_per_city（預設 3）
-           - 避免單一城市集中風險
-```
+### 資料來源
 
-### weather_customized 專屬參數
-
-| 參數 | 預設值 | 說明 |
+| 資料 | API | 時機 |
 |---|---|---|
-| `customized_lookback_ticks` | 4 | 斜率計算使用的歷史 tick 數（每 tick ≈ loop_interval_sec 秒） |
-| `customized_min_slope` | 0.0 | 每 tick 最低上升幅度。設 `0.0` 只排除下跌；設 `0.002` 要求每 tick 漲 0.2¢ |
-| `customized_min_history_ticks` | 3 | 歷史 tick 不足時跳過斜率閘門，允許在市場剛開盤時入場 |
-| `customized_min_entry_price` | 0.30 | 進場最低 token ask（USDC）。低於此值跳過（廉價 token 流動性不足） |
-| `customized_max_entry_price` | 0.85 | 進場最高 token ask（USDC）。高於此值跳過（費用無法被抵銷） |
-| `customized_max_ensemble_spread_celsius` | 4.0 | Ensemble 成員最大溫度標準差（°C）。超過代表模型高度不確定 |
-| `customized_max_positions_per_city` | 3 | 同一城市最多持倉數 |
+| 活躍市場清單 | Polymarket Gamma API | 每次 loop 開頭 |
+| YES / NO 訂單簿 | Polymarket CLOB API | 每個候選市場各拉一次 |
+| GFS Ensemble 預報（30 成員） | Open-Meteo Ensemble API | 每城市一次，60 秒快取 |
+| 結算價 | Polymarket Gamma API | 持倉到期後查詢，最多重試 3 次 |
+| METAR 實況觀測 | aviationweather.gov | 目標日當天監控時取代 Ensemble |
 
-繼承自 `WeatherStrategy` 的參數（全部適用）：`forecast_temp_bias_celsius`、`min_sl_ticks`、`stop_loss_delta`、`profit_target`、`forecast_shift_threshold`、`min_model_confidence`、`min_ensemble_members` 等。
+---
 
-### 範例設定（`config/settings.toml`）
+### 每次 loop（每 15 分鐘）詳細步驟
 
-```toml
-[[strategies]]
-id                   = "weather_custom_london"
-strategy_type        = "WeatherCustomized"
-enabled              = true
-capital_allocation_pct = 0.15
-trade_size_pct       = 0.05
-max_drawdown_pct     = 0.20
+#### 第一階段：前置檢查
 
-# Ensemble / decision thresholds
-min_model_confidence = 0.65
-min_ensemble_members = 10
-forecast_temp_bias_celsius = 2.0  # 2026 春季倫敦暖化修正
+1. **到期冷卻清理**：清除 `exited_slugs` 中超過 24 小時的記錄，解鎖可重入
+2. **熔斷器檢查**：若本策略資金觸及 `max_drawdown_pct`（30%），跳過本輪掃描
 
-# Stop-loss & TP
-stop_loss_delta      = 0.12
-profit_target        = 0.10
-min_sl_ticks         = 2
-forecast_shift_threshold = 0.15
+---
 
-# Customized gates
-customized_lookback_ticks             = 4
-customized_min_slope                  = 0.001   # 每 tick 至少漲 0.1¢
-customized_min_history_ticks          = 3
-customized_min_entry_price            = 0.30
-customized_max_entry_price            = 0.80
-customized_max_ensemble_spread_celsius = 3.0
-customized_max_positions_per_city     = 2
+#### 第二階段：監控現有持倉
+
+對每個持倉依序檢查四個退出條件，**最先觸發的優先執行**：
+
+**① TIME_DECAY_EXIT（到期強制退出）**
+
+觸發條件：`Instant::now() >= abort_at`（距市場關閉時間 < `abort_before_close_sec`）
+
+```
+1. 查 UMA oracle 結算價（gamma::fetch_token_settlement_price）
+   ├─ 取得 1.0 / 0.0 → SETTLEMENT，以真實 PnL 記帳
+   └─ 未就緒 → 每 60 秒重試，最多 3 次
+       ├─ 重試成功 → SETTLEMENT
+       └─ 3 次失敗 → TIME_DECAY_EXIT，以 entry_price 估算 PnL（dry_run 模式）
+                     live 模式：拉訂單簿最新 bid 離場
 ```
 
-### 與 weather_ensemble_prob 的差異
+**② TAKE_PROFIT（Trailing 止盈）**
 
-| 項目 | weather_ensemble_prob | weather_customized |
+每 tick 更新最高水位 `bid_best = max(bid_best, current_bid)`：
+
+```
+effective_gap = min(profit_target, (1 - bid_best) × 2)，最小 2¢
+trailing_floor = max(bid_best - effective_gap, entry + profit_target)
+
+觸發條件：
+  bid_best ≥ entry + profit_target（獲利已啟動）
+  AND current_bid < trailing_floor（回落超過 gap）
+  AND exit_price > entry + 2 × taker_fee_pct（防虧損出場）
+```
+
+| bid_best | profit_target=0.10 | effective_gap | trailing_floor |
+|---|---|---|---|
+| 0.60 | 0.10 | 0.10 | 0.50 |
+| 0.90 | 0.10 | 0.10 | 0.80 |
+| 0.95 | 0.08 | 0.08 | 0.87 |
+| 0.99 | 0.02 | 0.02 | 0.97 |
+
+**③ STOP_LOSS（Trailing 止損）**
+
+```
+current_lead_days = target_date - today
+
+sl_delta = stop_loss_delta × 2   （lead_days ≥ 1，隔日以上，給更大緩衝）
+         = stop_loss_delta        （lead_days = 0，當日市場）
+
+effective_sl = max(entry - sl_delta, bid_best - sl_delta)
+
+觸發條件：
+  current_ask ≤ effective_sl（連續 min_sl_ticks=2 tick 確認）
+```
+
+`min_sl_ticks=2` 的目的：過濾薄流動性市場單筆大單造成的瞬間噪音，需兩個 15 分鐘 tick 持續低於止損線才出場。
+
+**④ FORECAST_SHIFT（預測偏移強制退出）**
+
+```
+shift_threshold = forecast_shift_threshold × 2   （lead_days ≥ 1）
+                = forecast_shift_threshold         （lead_days = 0）
+
+預報來源：
+  lead_days ≥ 1 → GFS Ensemble 重新計票
+  lead_days = 0 → METAR 實況觀測（MetarShort，σ=2.5°C CDF）
+                  失敗時回退 Ensemble
+
+觸發條件：
+  |new_p_yes - entry_p_yes| ≥ shift_threshold
+  AND 方向已翻轉（持 NO 但新信號為 BuyYes 或 Hold）
+  AND new_p_yes > 0.02（排除 API 異常導致的假信號）
+```
+
+**倫敦範例（目標日當天 lead_days=0）**：
+上午 10 點入場 19°C NO（entry_p_yes=0.12），  
+下午 3 點 METAR 顯示倫敦 EGLC 氣溫 21°C。  
+MetarShort CDF（σ=2.5°C，μ=21°C）：P(temp=19°C) = Φ((19.5-21)/2.5) - Φ((18.5-21)/2.5) ≈ 0.27  
+shift = |0.27 - 0.12| = 0.15 ≥ 0.15，方向翻轉 → **FORECAST_SHIFT 強制退出**
+
+---
+
+#### 第三階段：掃描新進場（scan_for_entries）
+
+**前置過濾**（拉訂單簿之前，零 API 成本）：
+
+```
+✗ 已有該 slug 的持倉
+✗ 該 slug 在 24 小時冷卻期內
+✗ 城市不在 city_whitelist（NYC/London/Tokyo/Miami/Chicago）
+✗ lead_days < 1 或 > 5（不做同日/超長期市場）
+✗ 訂單簿深度 < weather_min_depth_usdc（$60）
+✗ 距市場關閉 < effective_abort_sec
+```
+
+**峰值桶預計算**（整批拉完市場後，進入逐市場迴圈前）：
+
+```
+對每個城市+日期組：
+  找出 liquidity_clob 最高的市場 → 記入 peak_no_slugs
+  （此步為純記憶體操作，不拉 API）
+```
+
+**逐市場評估**（每個候選市場依序執行）：
+
+```
+[閘門 5] CITY_EXPOSURE
+  同城市持倉數 ≥ 2 → 跳過整個城市（不拉任何訂單簿）
+
+[閘門 4] ENSEMBLE_SPREAD（拉訂單簿之前）
+  Ensemble 成員溫度 std_dev > 3.0°C → 跳過
+  原理：spread 大 = 30 個成員預測值分散，模型本身不確定
+
+  → 拉 YES 訂單簿 + NO 訂單簿（兩次 CLOB API call）
+
+[基礎閘門 A] SPREAD_WIDE
+  YES spread（ask-bid）> max_spread（0.05）→ Hold（流動性不足）
+
+[基礎閘門 B] LOW_DEPTH
+  YES 訂單簿深度 < 60 USDC → Hold
+
+[更新報價歷史]
+  price_history[slug].push_back(PriceTick { no_ask, yes_ask })
+  保留最近 5 筆（lookback_ticks=4 + 1）
+
+[基礎閘門 C] 信心 + Edge（weather_decision::evaluate）
+  p_yes = Ensemble 成員中落在 [lo, hi] 溫度範圍的比例
+          （需 ≥ min_ensemble_members=20 個有效成員）
+
+  cost_frac = (taker_fee_bps=180 + slippage_buffer_bps=45) / 10000 = 0.0225
+
+  edge_yes = p_yes - yes_ask - cost_frac
+  edge_no  = (1 - p_yes) - no_ask - cost_frac
+
+  優先 BuyYes：edge_yes ≥ 450bps 且 edge_yes ≥ edge_no
+    → 再查：p_yes ≥ min_temprange_p_yes（0.26，Ensemble 則用 min_model_confidence）
+  否則 BuyNo：edge_no ≥ 450bps
+    → 再查下方閘門 7
+  否則 → Hold，跳過
+
+[閘門 2] MIN_ENTRY_PRICE
+  entry_ask < 0.30 → 跳過（廉價 token，流動性差）
+
+[閘門 3] MAX_ENTRY_PRICE
+  entry_ask > 0.90 → 跳過（費用侵蝕獲利）
+
+[閘門 1] LOOKBACK_SLOPE（歷史 tick ≥ 3 時才啟用）
+  slope = (price[-1] - price[0]) / (n-1)
+  slope < customized_min_slope（0.001）→ 跳過（價格趨勢下行）
+
+[閘門 6] PEAK_BUCKET_BLOCK（僅 BuyNo）
+  market.slug ∈ peak_no_slugs → 跳過
+  原理：同城市+日期中流動性最高的桶 = 市場最確信的溫度，不逆押 NO
+
+[閘門 7] HIGH_YES_CONFIDENCE（僅 BuyNo）
+  yes_best_ask ≥ 0.35 時：
+    需 (1 - p_yes) ≥ 0.85（即 p_yes ≤ 0.15）
+  yes_best_ask < 0.35 時：
+    需 (1 - p_yes) ≥ 0.70（正常門檻）
+  不符合 → 跳過
+
+  ↓ 全部通過 ↓
+
+[下單]
+  side = BuyYes / BuyNo
+  entry_ask = 當前 best_ask
+  bet_size = 由 SharedCapital::current_bet_size() 決定（trade_size_pct × 可用資金）
+  profit_target = (180×2 + 45×2 + 450×0.5) / 10000 = 0.0675（約 6.75¢）
+  stop_loss_price = entry_ask - sl_delta（lead_days≥1 時 sl_delta=0.24，=0 時=0.12）
+
+  dry_run：寫入 weather_dry_run_trades 表，不送出訂單
+  live：呼叫 CLOB API 下限價單
+```
+
+---
+
+### 進場後持倉欄位
+
+| 欄位 | 說明 |
+|---|---|
+| `entry_price` | 入場 ask 價格 |
+| `bid_best` | 持倉期間最高 bid 水位（trailing TP 基準） |
+| `stop_loss_price` | 固定底線（entry - sl_delta） |
+| `profit_target` | TP 啟動門檻（≈6.75¢） |
+| `p_yes_at_entry` | 入場時模型 p_yes（用於 FORECAST_SHIFT 計算偏移量） |
+| `abort_at` | 強制退出時間點（close_ts - effective_abort_sec） |
+| `consecutive_sl_ticks` | 連續低於止損線的 tick 計數（需達 2 才真正出場） |
+
+---
+
+### weather_custom_verify 完整參數
+
+| 參數 | 設定值 | 說明 |
 |---|---|---|
-| 預測模型 | Ensemble（計票） | Ensemble（計票，相同邏輯） |
-| 斜率確認 | 無 | 必須通過 Lookback Slope 閘門 |
-| 進場價格範圍 | 無限制 | 30%–85%（可調） |
-| 模型分歧過濾 | 無 | Ensemble 標準差 ≤ 4°C（可調） |
-| 城市集中度 | 無 | 同城市最多 3 倉（可調） |
-| 目的 | 最大化交易機會 | 只在高信心、低雜訊時入場 |
+| `capital_allocation_pct` | 0.05 | 使用總資金 5%（灰度驗證） |
+| `trade_size_pct` | 0.05 | 每筆 5% 可用資金 |
+| `max_drawdown_pct` | 0.30 | 回撤 30% 熔斷 |
+| `loop_interval_sec` | 900 | 每 15 分鐘掃描一次 |
+| `taker_fee_bps` | 180 | Taker 費率（1.8%） |
+| `slippage_buffer_bps` | 45 | 滑點緩衝 |
+| `min_net_edge_bps` | 450 | 最低邊際（4.5%） |
+| `max_spread` | 0.05 | 訂單簿最大價差（5¢） |
+| `min_model_confidence` | 0.70 | BuyNo 正常信心門檻 |
+| `min_ensemble_members` | 20 | 最低有效 Ensemble 成員數 |
+| `weather_min_depth_usdc` | 60 | 訂單簿最低深度 |
+| `weather_min_lead_days` | 1 | 最短 1 天後結算（不做當日市場進場） |
+| `weather_max_lead_days` | 5 | 最長 5 天後結算 |
+| `city_whitelist` | NYC/London/Tokyo/Miami/Chicago | 交易城市 |
+| `min_temprange_p_yes` | 0.26 | TempRange BuyYes 最低 p_yes |
+| `stop_loss_delta` | 0.12（×2=0.24 for lead≥1） | 止損距離 |
+| `profit_target` | 0.10（計算後實際 ≈ 0.0675） | TP 啟動門檻 |
+| `min_sl_ticks` | 2 | 止損需連續 2 tick 確認 |
+| `forecast_shift_threshold` | 0.15（×2=0.30 for lead≥1） | 預測偏移強制退出門檻 |
+| `customized_lookback_ticks` | 4 | 斜率歷史視窗（≈60 分鐘） |
+| `customized_min_slope` | 0.001 | 每 tick 最低漲幅（0.1¢） |
+| `customized_min_history_ticks` | 3 | 歷史不足時略過斜率閘門 |
+| `customized_min_entry_price` | 0.30 | 進場最低 ask |
+| `customized_max_entry_price` | 0.90 | 進場最高 ask |
+| `customized_max_ensemble_spread_celsius` | 3.0 | Ensemble 成員最大標準差（°C） |
+| `customized_max_positions_per_city` | 2 | 同城市最多 2 倉 |
+| `high_yes_ask_threshold` | 0.35 | 觸發高信心門檻的 YES ask 下限 |
+| `high_yes_min_confidence_no` | 0.85 | 高 YES 市場的 BuyNo 信心要求 |
+
+> `forecast_temp_bias_celsius` 對 Ensemble 直接計票**無效**，`weather_custom_verify` 不設此值。
 
 ---
 

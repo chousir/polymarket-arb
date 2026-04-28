@@ -582,19 +582,24 @@ city_whitelist                          = ["NYC", "London", "Tokyo", "Miami", "C
 weather_forecast_model                  = "ensemble"
 forecast_shift_threshold                = 0.15
 min_temprange_p_yes                     = 0.26
-forecast_temp_bias_celsius              = 1.5               # 2026 春季暖化修正（保守值）
 stop_loss_delta                         = 0.12
 profit_target                           = 0.10
 min_sl_ticks                            = 2                 # 需連續 2 tick 才觸發止損
+
+# ── High-YES 市場保護 ─────────────────────────────────────────────────────────
+# 當市場 YES ask >= threshold，BuyNo 的模型信心要求從 0.70 提升到 high_yes_min_confidence_no
+# 防止在市場高度看好某桶時逆市場下 NO（例如 YES=50% 但模型說 25%，gap 不夠可靠）
+high_yes_ask_threshold                  = 0.35
+high_yes_min_confidence_no              = 0.85
 
 # ── Customized 閘門 ───────────────────────────────────────────────────────────
 customized_lookback_ticks               = 4                 # 保留最近 4 tick（≈60min）歷史
 customized_min_slope                    = 0.001             # 每 tick 至少漲 0.1¢（過濾震盪）
 customized_min_history_ticks            = 3                 # 歷史不足 3 tick 時略過斜率閘
 customized_min_entry_price              = 0.30              # 不買廉價低流動性 token
-customized_max_entry_price              = 0.85              # 確保費用後仍有獲利空間
+customized_max_entry_price              = 0.90              # 放寬上限：高定價 NO 若 EV 為正仍可進
 customized_max_ensemble_spread_celsius  = 3.0               # 成員分歧 ≤ 3°C
-customized_max_positions_per_city       = 2                 # 同城市最多 2 倉
+customized_max_positions_per_city       = 2                 # 同城市最多 2 倉（峰值桶保護另外攔截）
 
 # ── 標準版（驗證版穩定 7 天後啟用）────────────────────────────────────────────
 # 放寬斜率與入場價格範圍，提升進場頻率，增加資金

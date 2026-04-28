@@ -260,6 +260,8 @@ mod tests {
             customized_min_history_ticks: 3,
             customized_max_ensemble_spread_celsius: 4.0,
             customized_max_positions_per_city: 3,
+            high_yes_ask_threshold: 1.1,
+            high_yes_min_confidence_no: 0.85,
             ladder_min_leg_price: 0.0002,
             ladder_max_leg_price: 0.15,
             ladder_min_payout_ratio: 80.0,

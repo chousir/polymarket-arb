@@ -127,6 +127,10 @@ struct RawStrategyConfig {
     customized_max_ensemble_spread_celsius: Option<f64>,
     /// Maximum number of simultaneously open positions per city (default 3).
     customized_max_positions_per_city: Option<usize>,
+    /// Market YES ask threshold above which BUY_NO requires higher model confidence (default 0.35).
+    high_yes_ask_threshold: Option<f64>,
+    /// Minimum (1-p_yes) for BUY_NO when market YES >= high_yes_ask_threshold (default 0.85).
+    high_yes_min_confidence_no: Option<f64>,
     // ── WeatherLadder 專用 ─────────────────────────────────────────────────
     ladder_min_leg_price: Option<f64>,
     ladder_max_leg_price: Option<f64>,
@@ -274,6 +278,8 @@ pub struct StrategyConfig {
     pub customized_min_history_ticks: u32,
     pub customized_max_ensemble_spread_celsius: f64,
     pub customized_max_positions_per_city: usize,
+    pub high_yes_ask_threshold: f64,
+    pub high_yes_min_confidence_no: f64,
     // ── WeatherLadder 專用 ─────────────────────────────────────────────────────
     pub ladder_min_leg_price: f64,
     pub ladder_max_leg_price: f64,
@@ -426,6 +432,8 @@ impl BotConfig {
                     customized_min_history_ticks:           s.customized_min_history_ticks.unwrap_or(3),
                     customized_max_ensemble_spread_celsius: s.customized_max_ensemble_spread_celsius.unwrap_or(4.0),
                     customized_max_positions_per_city:      s.customized_max_positions_per_city.unwrap_or(3),
+                    high_yes_ask_threshold:      s.high_yes_ask_threshold.unwrap_or(0.35),
+                    high_yes_min_confidence_no:  s.high_yes_min_confidence_no.unwrap_or(0.85),
                     // WeatherLadder-specific
                     ladder_min_leg_price:                 s.ladder_min_leg_price.unwrap_or(0.0002),
                     ladder_max_leg_price:                 s.ladder_max_leg_price.unwrap_or(0.15),

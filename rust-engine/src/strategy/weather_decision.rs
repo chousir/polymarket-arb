@@ -77,6 +77,14 @@ pub struct WeatherDecisionConfig {
     /// Applies only to CDF-based models (GFS / ECMWF); ensemble member counting is unaffected.
     /// Default 0.0; set to +2.0 or +3.0 when systematic underestimation is observed.
     pub forecast_temp_bias_celsius: f64,
+    /// When market YES ask >= this value, use `high_yes_min_confidence_no` for BUY_NO
+    /// instead of `min_model_confidence_temprange`.  Prevents betting NO against strong
+    /// market consensus.  Default 0.35 (i.e. 35% YES triggers stricter gate).
+    pub high_yes_ask_threshold: f64,
+    /// Minimum (1-p_yes) required for BUY_NO when market YES >= high_yes_ask_threshold.
+    /// Default 0.85: model must assign ≤15% chance to the YES outcome before fighting
+    /// a market that already prices it at ≥35%.
+    pub high_yes_min_confidence_no: f64,
 }
 
 /// Trade direction returned by the decision model.
@@ -192,6 +200,45 @@ pub fn probability_yes(
                 let p_above = 1.0 - normal_cdf((threshold - mu) / sigma);
                 Some(if extreme_is_above(&market.question) { p_above } else { 1.0 - p_above })
             }
+        }
+        WeatherMarketType::Precip => Some(forecast.prob_precip),
+        WeatherMarketType::Unknown => None,
+    }
+}
+
+/// Like `probability_yes` but with an explicit sigma (°C) instead of looking up
+/// `temp_model_sigma`.  Used by the Consensus path after calibrating sigma from
+/// the Ensemble member spread.  Always uses the CDF path — do not pass an
+/// Ensemble forecast here; use `probability_yes` for that.
+///
+/// Returns None if sigma ≤ 0 or if the market has no valid temp range.
+pub fn probability_yes_sigma(
+    forecast: &WeatherForecast,
+    market: &WeatherMarket,
+    sigma: f64,
+    bias_celsius: f64,
+) -> Option<f64> {
+    if sigma <= 0.0 {
+        return None;
+    }
+    let mu = forecast.max_temp_c + bias_celsius;
+    match market.market_type {
+        WeatherMarketType::TempRange => {
+            let (lo_raw, hi_raw) = market.temp_range?;
+            let (lo, hi) = if (hi_raw - lo_raw).abs() < 0.01 {
+                (lo_raw - 0.5, hi_raw + 0.5)
+            } else {
+                (lo_raw, hi_raw)
+            };
+            if hi - lo <= 0.0 {
+                return None;
+            }
+            Some(normal_cdf((hi - mu) / sigma) - normal_cdf((lo - mu) / sigma))
+        }
+        WeatherMarketType::Extreme => {
+            let (threshold, _) = market.temp_range?;
+            let p_above = 1.0 - normal_cdf((threshold - mu) / sigma);
+            Some(if extreme_is_above(&market.question) { p_above } else { 1.0 - p_above })
         }
         WeatherMarketType::Precip => Some(forecast.prob_precip),
         WeatherMarketType::Unknown => None,
@@ -362,18 +409,25 @@ fn score_signal(
         }
     } else if edge_no >= min_edge {
         // Direction-specific confidence gate for BUY_NO
-        let min_conf_no = if is_temprange {
+        let base_conf_no = if is_temprange {
             cfg.min_model_confidence_temprange
         } else {
             cfg.min_model_confidence
+        };
+        // High-YES gate: when market prices YES >= threshold, require stronger conviction.
+        // Prevents betting NO against genuine market consensus on the most-likely bucket.
+        let min_conf_no = if snapshot.yes_best_ask >= cfg.high_yes_ask_threshold {
+            base_conf_no.max(cfg.high_yes_min_confidence_no)
+        } else {
+            base_conf_no
         };
         if (1.0 - p_yes) < min_conf_no {
             return hold(
                 p_yes,
                 format!(
-                    "BUY_NO blocked: (1-p_yes)={:.3} < min={:.3} ({})",
+                    "BUY_NO blocked: (1-p_yes)={:.3} < min={:.3} (yes_ask={:.3}, threshold={:.2})",
                     1.0 - p_yes, min_conf_no,
-                    if is_temprange { "temprange" } else { "extreme" }
+                    snapshot.yes_best_ask, cfg.high_yes_ask_threshold
                 ),
                 "LOW_CONFIDENCE",
             );
@@ -625,6 +679,8 @@ mod tests {
             bet_size_usdc: 20.0,
             city_sigma_mult: 1.0,
             forecast_temp_bias_celsius: 0.0,
+            high_yes_ask_threshold: 1.1,    // disabled in unit tests (>1.0 never triggers)
+            high_yes_min_confidence_no: 0.85,
         }
     }
 

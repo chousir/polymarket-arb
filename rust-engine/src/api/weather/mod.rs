@@ -118,6 +118,19 @@ impl WeatherForecast {
         let count = members.iter().filter(|&&t| t > threshold).count();
         Some(count as f64 / members.len() as f64)
     }
+
+    /// Returns (mean, std_dev) of ensemble member temperatures.
+    /// Returns None if this is not an ensemble forecast or has no members.
+    pub fn ensemble_mean_std(&self) -> Option<(f64, f64)> {
+        let members = self.ensemble_members.as_deref()?;
+        if members.is_empty() {
+            return None;
+        }
+        let n = members.len() as f64;
+        let mean = members.iter().sum::<f64>() / n;
+        let variance = members.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        Some((mean, variance.sqrt()))
+    }
 }
 
 // ── CityInfo ──────────────────────────────────────────────────────────────────

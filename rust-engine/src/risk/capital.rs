@@ -153,6 +153,27 @@ impl CapitalTracker {
         }
     }
 
+    /// 天氣策略進場：鎖定賭注資金（手續費計入出場時的 realized_pnl）
+    pub fn on_weather_entry(&mut self, bet_size: f64) {
+        self.current_capital -= bet_size;
+    }
+
+    /// 天氣策略出場：釋放資金並套用實際損益
+    /// realized_pnl_usdc 已包含雙邊手續費扣除
+    pub fn on_weather_exit(&mut self, bet_size: f64, realized_pnl_usdc: f64) {
+        self.current_capital += bet_size + realized_pnl_usdc;
+        self.total_estimated_pnl += realized_pnl_usdc;
+        if self.is_stopped() {
+            tracing::warn!(
+                "[Capital:{}] ⛔ 觸發停損！drawdown={:.1}%  current={:.4}  min={:.4}",
+                self.strategy_id,
+                self.drawdown_pct() * 100.0,
+                self.current_capital,
+                self.min_capital,
+            );
+        }
+    }
+
     /// Live 模式：用鏈上查詢的真實餘額覆蓋當前資金
     /// （僅在策略啟動時呼叫一次）
     pub fn override_from_onchain(&mut self, balance_usdc: f64) {
@@ -228,6 +249,8 @@ mod tests {
             customized_min_history_ticks: 3,
             customized_max_ensemble_spread_celsius: 4.0,
             customized_max_positions_per_city: 3,
+            high_yes_ask_threshold: 1.1,
+            high_yes_min_confidence_no: 0.85,
             ladder_min_leg_price: 0.0002,
             ladder_max_leg_price: 0.15,
             ladder_min_payout_ratio: 80.0,
