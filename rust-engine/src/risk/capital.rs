@@ -113,7 +113,7 @@ impl CapitalTracker {
         fee_per_leg: f64,
     ) {
         match (leg1_price, leg2_price) {
-            (Some(p1), Some(p2)) => {
+            (Some(p1), Some(p2)) if p1 > 1e-9 && p2 > 1e-9 => {
                 // 等金額下注的期望報酬
                 let expected_payout = leg_bet_size * (1.0 / p1 + 1.0 / p2) / 2.0;
                 // 回收：bet × 2 已在 on_order_submit 扣除，這裡加回報酬
@@ -129,6 +129,15 @@ impl CapitalTracker {
                     expected_payout,
                     estimated_pnl,
                     self.current_capital,
+                );
+            }
+            (Some(_), Some(_)) => {
+                // 零價格防護：p1 或 p2 = 0（無買盤），視為全損，資金不回收
+                let estimated_pnl = -2.0 * leg_bet_size - 2.0 * fee_per_leg;
+                self.total_estimated_pnl += estimated_pnl;
+                tracing::warn!(
+                    "[Capital:{}] ⚠ 零價格防護：p = 0，視為全損  est_pnl={:.4}  remaining={:.4}",
+                    self.strategy_id, estimated_pnl, self.current_capital,
                 );
             }
             (Some(_), None) => {

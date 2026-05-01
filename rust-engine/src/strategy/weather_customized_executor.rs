@@ -1,11 +1,13 @@
-// Weather Customized strategy — Ensemble model with enhanced entry filters.
+// Weather Customized strategy — configurable forecast model with enhanced entry filters.
 //
 // Architecture
 // ────────────
 // Shares the same monitoring/exit loop as WeatherStrategy (TAKE_PROFIT,
 // STOP_LOSS with tick filter, TIME_DECAY_EXIT with settlement check,
-// FORECAST_SHIFT).  The only difference is in scan_for_entries, which runs
-// FIVE additional gates before any position is opened:
+// FORECAST_SHIFT).  The forecast model is read from `weather_forecast_model`
+// in settings.toml and can be any of: gfs, ecmwf, ensemble, nws, metar_short,
+// consensus.  The only difference from WeatherStrategy is in scan_for_entries,
+// which runs SEVEN additional gates before any position is opened:
 //
 //   Gate 1 – LOOKBACK_SLOPE
 //     Store the ask price of the intended trade direction for the last
@@ -21,13 +23,22 @@
 //     Token ask must be ≤ customized_max_entry_price (default 0.85).
 //     Avoids overpriced tokens where upside is too thin to cover fees.
 //
-//   Gate 4 – ENSEMBLE_SPREAD
+//   Gate 4 – ENSEMBLE_SPREAD (Ensemble model only)
 //     Ensemble temperature std-dev must be ≤ customized_max_ensemble_spread_celsius
 //     (default 4.0 °C).  High spread = model is uncertain → skip.
+//     Silently skipped for deterministic models (no ensemble_members).
 //
 //   Gate 5 – CITY_EXPOSURE
 //     Open positions for the same city must be < customized_max_positions_per_city
 //     (default 3).  Prevents concentration risk in one location.
+//
+//   Gate 6 – PEAK_BUCKET_BLOCK (BuyNo only)
+//     The highest-liquidity bucket per city+date is blocked for BuyNo.
+//     Prevents betting against market consensus on the most-favoured temperature.
+//
+//   Gate 7 – HIGH_YES_CONFIDENCE (BuyNo only)
+//     When market YES ask ≥ high_yes_ask_threshold, requires
+//     (1−p_yes) ≥ high_yes_min_confidence_no.
 //
 // DRY_RUN compliance
 // ──────────────────
@@ -52,11 +63,14 @@ use crate::execution::executor;
 use crate::notify::telegram::Notifier;
 use crate::risk::capital::SharedCapital;
 use crate::strategy::weather_decision::{
-    self, WeatherBookSnapshot, WeatherDecisionConfig, WeatherDirection,
+    self, WeatherBookSnapshot, WeatherDecisionConfig, WeatherDirection, WeatherSignal,
 };
 use crate::strategy::weather_executor::{
-    fetch_city_forecast_single, find_forecast_for_date, FORECAST_LEAD_BUFFER,
+    fetch_city_forecast_single, fetch_consensus_forecasts_for_cities,
+    evaluate_consensus_signal_for_market, ConsensusCityForecasts,
+    find_forecast_for_date, FORECAST_LEAD_BUFFER,
 };
+use crate::strategy::weather_executor::parse_weather_model;
 use crate::strategy::weather_filter::{filter_market, WeatherFilterConfig};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -104,15 +118,18 @@ struct WeatherCustomPosition {
 // ── Public strategy struct ────────────────────────────────────────────────────
 
 pub struct WeatherCustomizedStrategy {
-    global:   BotConfig,
-    sc:       StrategyConfig,
-    capital:  SharedCapital,
-    notifier: Option<Notifier>,
+    global:         BotConfig,
+    sc:             StrategyConfig,
+    capital:        SharedCapital,
+    notifier:       Option<Notifier>,
+    /// Resolved once at construction from `sc.weather_forecast_model`.
+    forecast_model: WeatherModel,
 }
 
 impl WeatherCustomizedStrategy {
     pub fn new(global: BotConfig, sc: StrategyConfig, capital: SharedCapital, notifier: Option<Notifier>) -> Self {
-        Self { global, sc, capital, notifier }
+        let forecast_model = parse_weather_model(&sc.weather_forecast_model);
+        Self { global, sc, capital, notifier, forecast_model }
     }
 
     async fn tg(&self, emoji: &str, title: &str, detail: &str) {
@@ -209,8 +226,7 @@ impl WeatherCustomizedStrategy {
                                 .on_weather_exit(pos.size_usdc, pnl);
                         } else {
                             self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                                .on_cycle_end(Some(pos.entry_price), Some(settled_price), pos.size_usdc,
-                                              self.global.compute_fee(pos.size_usdc));
+                                .on_weather_exit(pos.size_usdc, pnl);
                         }
                         self.tg("💰", "SETTLEMENT",
                             &format!("{} side={} settled={:.4} pnl={:+.4} USDC",
@@ -240,13 +256,14 @@ impl WeatherCustomizedStrategy {
                                 continue;
                             }
                         };
+                        let live_td_pnl = (book.best_bid - pos.entry_price) * pos.size_usdc
+                            - self.global.compute_fee(pos.size_usdc) * 2.0;
                         if let Err(e) = self.submit_live_exit(pos, book.best_bid, db, "TIME_DECAY_EXIT").await {
                             tracing::warn!("[Custom:{}] TIME_DECAY_EXIT live 失敗: {e}", self.sc.id);
                             continue;
                         }
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), Some(book.best_bid), pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, live_td_pnl);
                     }
                     newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
@@ -301,8 +318,7 @@ impl WeatherCustomizedStrategy {
                             continue;
                         }
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, pnl);
                     }
                     self.tg("💚", "TAKE_PROFIT",
                         &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
@@ -340,12 +356,18 @@ impl WeatherCustomizedStrategy {
 
                 let forecast_days = self.sc.weather_max_lead_days + FORECAST_LEAD_BUFFER;
                 let city_ci = city_info(&pos.market.city);
+                // For FORECAST_SHIFT, Consensus falls back to Ensemble (sufficient for
+                // detecting a shift; full 3-model re-evaluation is not needed).
+                let shift_model = if self.forecast_model == WeatherModel::Consensus {
+                    WeatherModel::Ensemble
+                } else {
+                    self.forecast_model
+                };
                 let fresh_forecasts = if let Some(ci) = city_ci {
                     if current_lead_days == 0 {
                         // Target day has arrived: use real-time METAR observation instead of
-                        // a stale overnight Ensemble run.  MetarShort CDF (σ=2.5°C) is used
-                        // so the decision layer can evaluate whether the current temperature
-                        // already makes the NO outcome improbable.
+                        // a stale overnight forecast.  MetarShort CDF (σ=2.5°C) provides
+                        // real-time anchoring regardless of the configured model.
                         match metar::fetch_metar(ci, 2).await {
                             Ok(obs) => {
                                 tracing::debug!(
@@ -356,16 +378,16 @@ impl WeatherCustomizedStrategy {
                             }
                             Err(e) => {
                                 tracing::debug!(
-                                    "[Custom:{}] {} METAR 失敗，回退 Ensemble: {e}",
-                                    self.sc.id, pos.market.city
+                                    "[Custom:{}] {} METAR 失敗，回退 {}: {e}",
+                                    self.sc.id, pos.market.city, shift_model
                                 );
-                                fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days)
+                                fetch_city_forecast_single(ci, shift_model, forecast_days)
                                     .await
                                     .unwrap_or_default()
                             }
                         }
                     } else {
-                        fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days)
+                        fetch_city_forecast_single(ci, shift_model, forecast_days)
                             .await
                             .unwrap_or_default()
                     }
@@ -408,8 +430,7 @@ impl WeatherCustomizedStrategy {
                                 continue;
                             }
                             self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                                .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                              self.global.compute_fee(pos.size_usdc));
+                                .on_weather_exit(pos.size_usdc, pnl);
                         }
                         newly_exited.push(pos.market_slug.clone());
                         to_remove.push(idx);
@@ -453,8 +474,7 @@ impl WeatherCustomizedStrategy {
                             continue;
                         }
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, pnl);
                     }
                     self.tg("🔴", "STOP_LOSS",
                         &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
@@ -556,11 +576,21 @@ impl WeatherCustomizedStrategy {
 
         let forecast_days = self.sc.weather_max_lead_days + FORECAST_LEAD_BUFFER;
         let cities: HashSet<String> = by_city.keys().cloned().collect();
+
+        // Fetch forecasts once for all cities, model-aware.
+        // Consensus needs 3-model data; all others use single-model fetch.
+        let consensus_forecasts: HashMap<String, ConsensusCityForecasts>;
         let mut city_forecasts: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
-        for city in &cities {
-            if let Some(ci) = city_info(city) {
-                if let Some(fcs) = fetch_city_forecast_single(ci, WeatherModel::Ensemble, forecast_days).await {
-                    city_forecasts.insert(city.clone(), fcs);
+        let use_consensus = self.forecast_model == WeatherModel::Consensus;
+        if use_consensus {
+            consensus_forecasts = fetch_consensus_forecasts_for_cities(&cities, forecast_days).await;
+        } else {
+            consensus_forecasts = HashMap::new();
+            for city in &cities {
+                if let Some(ci) = city_info(city) {
+                    if let Some(fcs) = fetch_city_forecast_single(ci, self.forecast_model, forecast_days).await {
+                        city_forecasts.insert(city.clone(), fcs);
+                    }
                 }
             }
         }
@@ -578,33 +608,43 @@ impl WeatherCustomizedStrategy {
                 continue;
             }
 
-            let forecasts = match city_forecasts.get(city) {
-                Some(f) => f,
-                None => {
-                    tracing::warn!("[Custom:{}] 城市 {city} 無法獲取預測", self.sc.id);
-                    continue;
+            // For non-Consensus models, look up single-model forecasts.
+            // For Consensus, we resolve per-market below using consensus_forecasts.
+            let non_consensus_forecasts: Option<&Vec<WeatherForecast>> = if !use_consensus {
+                match city_forecasts.get(city) {
+                    Some(f) => Some(f),
+                    None => {
+                        tracing::warn!("[Custom:{}] 城市 {city} 無法獲取預測", self.sc.id);
+                        continue;
+                    }
                 }
+            } else {
+                None
             };
 
             let decision_cfg = self.make_decision_cfg(filter_cfg.min_depth_usdc, city);
 
             for market in city_markets {
                 let lead_days = (market.target_date - Utc::now().date_naive()).num_days();
-                let fc = match find_forecast_for_date(forecasts, market.target_date) {
-                    Some(f) => f,
-                    None => continue,
-                };
 
-                // Gate 4 (ENSEMBLE_SPREAD): reject high-uncertainty forecasts
-                if let Some(members) = fc.ensemble_members.as_deref() {
-                    let spread = ensemble_std_dev(members);
-                    if spread > self.sc.customized_max_ensemble_spread_celsius {
-                        tracing::debug!(
-                            "[Custom:{}] {} 集成預報離散度 {:.2}°C > {:.2}°C 上限，跳過",
-                            self.sc.id, market.slug, spread,
-                            self.sc.customized_max_ensemble_spread_celsius
-                        );
-                        continue;
+                // Gate 4 (ENSEMBLE_SPREAD): only applicable for non-Consensus single-model fetches.
+                // For Consensus the evaluate_consensus_signal_for_market function already handles
+                // spread internally via its chaos check (ens_std > CHAOS_THRESHOLD_C).
+                if !use_consensus {
+                    let fc = match find_forecast_for_date(non_consensus_forecasts.unwrap(), market.target_date) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    if let Some(members) = fc.ensemble_members.as_deref() {
+                        let spread = ensemble_std_dev(members);
+                        if spread > self.sc.customized_max_ensemble_spread_celsius {
+                            tracing::debug!(
+                                "[Custom:{}] {} 集成預報離散度 {:.2}°C > {:.2}°C 上限，跳過",
+                                self.sc.id, market.slug, spread,
+                                self.sc.customized_max_ensemble_spread_celsius
+                            );
+                            continue;
+                        }
                     }
                 }
 
@@ -646,8 +686,26 @@ impl WeatherCustomizedStrategy {
                     history.pop_front();
                 }
 
-                // ── Core signal from ensemble model ───────────────────────────
-                let signal = weather_decision::evaluate(fc, market, &snap, &decision_cfg);
+                // ── Core signal — model-aware ─────────────────────────────────
+                let signal: WeatherSignal = if use_consensus {
+                    match consensus_forecasts.get(city) {
+                        Some(city_fc) => match evaluate_consensus_signal_for_market(
+                            city_fc, market, &snap, &decision_cfg,
+                            self.sc.consensus_max_divergence,
+                        ) {
+                            Some(s) => s,
+                            None => continue,
+                        },
+                        None => {
+                            tracing::warn!("[Custom:{}] 城市 {city} 無 consensus 預測，跳過", self.sc.id);
+                            continue;
+                        }
+                    }
+                } else {
+                    let fc = find_forecast_for_date(non_consensus_forecasts.unwrap(), market.target_date)
+                        .expect("already checked above");
+                    weather_decision::evaluate(fc, market, &snap, &decision_cfg)
+                };
                 if signal.direction == WeatherDirection::Hold {
                     continue;
                 }
@@ -770,7 +828,7 @@ impl WeatherCustomizedStrategy {
                         entry_price:            Some(entry_ask),
                         exit_price:             None,
                         hold_sec:               None,
-                        model:                  "ensemble".into(),
+                        model:                  self.forecast_model.to_string(),
                         p_yes_at_entry:         Some(signal.p_yes),
                         p_yes_at_exit:          None,
                         lead_days:              Some(lead_days),
@@ -798,7 +856,7 @@ impl WeatherCustomizedStrategy {
                         bid_best:              entry_ask,
                         stop_loss_price,
                         p_yes_at_entry:        signal.p_yes,
-                        model:                 WeatherModel::Ensemble,
+                        model:                 self.forecast_model,
                         lead_days,
                         expected_net_edge_bps: signal.edge_bps,
                         consecutive_sl_ticks:  0,
@@ -844,7 +902,7 @@ impl WeatherCustomizedStrategy {
                         bid_best:              entry_ask,
                         stop_loss_price,
                         p_yes_at_entry:        signal.p_yes,
-                        model:                 WeatherModel::Ensemble,
+                        model:                 self.forecast_model,
                         lead_days,
                         expected_net_edge_bps: signal.edge_bps,
                         consecutive_sl_ticks:  0,
@@ -903,7 +961,7 @@ impl WeatherCustomizedStrategy {
             entry_price:            Some(pos.entry_price),
             exit_price:             Some(exit_price),
             hold_sec:               Some(hold_sec),
-            model:                  "ensemble".to_string(),
+            model:                  pos.model.to_string(),
             p_yes_at_entry:         Some(pos.p_yes_at_entry),
             p_yes_at_exit:          p_yes_exit,
             lead_days:              Some(pos.lead_days),

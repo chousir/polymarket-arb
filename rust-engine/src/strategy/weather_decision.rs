@@ -414,6 +414,19 @@ fn score_signal(
         } else {
             cfg.min_model_confidence
         };
+        // Hard price floor: NO ask < 0.04 means market is ≥96% YES consensus.
+        // At these extreme prices the market likely has live observation data;
+        // model σ-based CDF is unreliable against confirmed measurements.
+        if snapshot.no_best_ask < 0.04 {
+            return hold(
+                p_yes,
+                format!(
+                    "BUY_NO blocked: no_ask={:.4} < 0.04 floor (市場共識 ≥96% YES，拒絕對抗)",
+                    snapshot.no_best_ask
+                ),
+                "LOW_EDGE",
+            );
+        }
         // High-YES gate: when market prices YES >= threshold, require stronger conviction.
         // Prevents betting NO against genuine market consensus on the most-likely bucket.
         let min_conf_no = if snapshot.yes_best_ask >= cfg.high_yes_ask_threshold {

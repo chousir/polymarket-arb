@@ -1,12 +1,12 @@
 # Polymarket 自動交易系統
 
 ## 核心策略
-BTC 15 分鐘 Up/Down 市場，Dump-Hedge 兩腿策略。
-開盤後監控急跌（Leg 1 入場），等待 Up+Down 總和 < 0.93 時對沖（Leg 2），
-鎖定利潤或限制虧損。
+天氣預報市場套利。使用 GFS Ensemble、NWS、ECMWF、Consensus 等科學氣象模型，
+計算各城市每日最高溫市場的真實機率，識別市場定價偏差後進場，
+以 Trailing Stop/Take-Profit 動態管理持倉。
 
 ## 語言分工
-- Rust：訂單簿監控、訊號計算、訂單執行、DRY_RUN 攔截
+- Rust：訂單簿監控、氣象預報拉取、訊號計算、訂單執行、DRY_RUN 攔截
 - Python：回測分析、參數優化、儀表板前端
 
 ## 交易模式（TRADING_MODE）
@@ -34,7 +34,8 @@ Rust 引擎啟動時不重新衍生憑證。
 - Gamma API: https://gamma-api.polymarket.com（免認證）
 - CLOB API: https://clob.polymarket.com（EIP-712 簽名）
 - WebSocket: wss://ws-subscriptions-clob.polymarket.com
-- Binance WS: wss://stream.binance.com:9443/ws/btcusdt@ticker
+- Open-Meteo: https://api.open-meteo.com（GFS / ECMWF / Ensemble 預報）
+- NWS API: https://api.weather.gov（美國城市官方預報，免認證）
 - 伺服器位置: AWS eu-west-2（倫敦），VPS 選愛爾蘭 / 倫敦
 
 ## 速率限制
@@ -45,7 +46,7 @@ Rust 引擎啟動時不重新衍生憑證。
 ## 費用（2026年）
 - Taker fee 加密市場: 最高 1.80%（50% 機率市場）
 - Maker（GTC 限價單）: 0%
-- 計算 hedge_threshold_sum 必須考慮雙邊 taker fee
+- 入場邊際計算必須扣除雙邊 taker fee
 
 ## Rust 常用指令
 - 建置: `cargo build --release`
@@ -68,11 +69,7 @@ CLOB_API_PASSPHRASE=
 DB_PATH=./data/market_snapshots.db
 TRADING_MODE=dry_run
 TELEGRAM_BOT_TOKEN=
-
-## IPC 機制（預留）
-Phase 1-2: ipc/sqlite_poller.rs（polling 500ms，已啟用）
-Phase 3: ipc/unix_socket.rs（< 1ms，本機單機，切換條件：Python 訊號需 5s 內到達）
-Phase 4+: ipc/redis_pubsub.rs（VPS 多進程部署）
+LOG_LEVEL=info
 
 ## 代碼規範
 - Rust: tokio 非同步，thiserror 錯誤類型，主路徑禁止 unwrap()
@@ -86,5 +83,5 @@ Phase 4+: ipc/redis_pubsub.rs（VPS 多進程部署）
 - 所有執行路徑必須有 DRY_RUN 檢查
 
 ## 開發階段
-目前：Phase 1（核心引擎）
-進入 live 的最低條件：dry_run ≥ 7 天、勝率 ≥ 60%、單輪最大虧損 < 20%
+目前：天氣策略驗證中（dry_run）
+進入 live 的最低條件：dry_run ≥ 7 天、勝率 ≥ 60%、單輪最大虧損 < 25%

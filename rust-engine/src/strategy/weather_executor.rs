@@ -56,6 +56,9 @@ use crate::strategy::weather_filter::{filter_market, WeatherFilterConfig};
 /// Ensures markets at the very edge of the lead window have data.
 pub const FORECAST_LEAD_BUFFER: u32 = 2;
 const METAR_SHORT_MAX_TTE_SEC: u64 = 24 * 3600;
+/// Minimum time-to-close for metar_short entries.
+/// Markets closing within 1 hour are skipped — too little time for settlement detection.
+const METAR_SHORT_MIN_TTE_SEC: u64 = 3600;
 const MIN_LOOP_INTERVAL_SEC: u64 = 30;
 /// Time reserved for the exit procedure itself (HTTP order + DB write).
 /// Kept separate from polling headroom so the two purposes are explicit.
@@ -102,7 +105,7 @@ struct WeatherPosition {
 }
 
 #[derive(Debug, Clone)]
-struct ConsensusCityForecasts {
+pub(crate) struct ConsensusCityForecasts {
     /// GFS is required; the consensus is skipped if it fails.
     gfs: Vec<WeatherForecast>,
     /// ECMWF is optional; consensus degrades gracefully to GFS+Ensemble if absent.
@@ -195,12 +198,32 @@ impl WeatherStrategy {
                     let market_still_open = entry.close_ts as u64 > now_ts_u64
                         && market_by_slug.contains_key(slug.as_str());
                     if !market_still_open {
-                        // Market resolved — write TIME_DECAY_EXIT immediately.
+                        // Market closed while engine was offline.
+                        // Try settlement API first; fall back to model-weighted PnL estimate.
                         let hold_sec = now_ts_u64 as i64 - entry.entry_ts;
-                        let realized_pnl = -self.global.compute_fee(entry.size_usdc);
+                        let settled_price = crate::api::gamma::fetch_token_settlement_price(
+                            &entry.market_slug, &entry.token_id,
+                        ).await.ok().flatten();
+
+                        let (action, exit_price, realized_pnl) = if let Some(sp) = settled_price {
+                            let pnl = (sp - entry.entry_price) * entry.size_usdc
+                                - self.global.compute_fee(entry.size_usdc) * 2.0;
+                            ("SETTLEMENT", sp, pnl)
+                        } else {
+                            // Oracle not yet settled; use model probability as estimated resolution
+                            let model_p = if entry.side == "YES" {
+                                entry.p_yes_at_entry
+                            } else {
+                                1.0 - entry.p_yes_at_entry
+                            };
+                            let pnl = (model_p - entry.entry_price) * entry.size_usdc
+                                - self.global.compute_fee(entry.size_usdc) * 2.0;
+                            ("TIME_DECAY_EXIT", entry.entry_price, pnl)
+                        };
+
                         tracing::info!(
-                            "[Weather:{}] 恢復 TIME_DECAY_EXIT: {} hold={}s pnl={:.4}",
-                            self.sc.id, slug, hold_sec, realized_pnl
+                            "[Weather:{}] 恢復 {}: {} hold={}s pnl={:.4}",
+                            self.sc.id, action, slug, hold_sec, realized_pnl
                         );
                         let _ = db.write_weather_dry_run_trade(&WeatherDryRunTrade {
                             strategy_id:            entry.strategy_id,
@@ -209,13 +232,13 @@ impl WeatherStrategy {
                             city:                   entry.city,
                             market_type:            entry.market_type,
                             side:                   entry.side,
-                            action:                 "TIME_DECAY_EXIT".into(),
-                            price:                  entry.entry_price,
+                            action:                 action.into(),
+                            price:                  exit_price,
                             size_usdc:              entry.size_usdc,
                             spread_at_decision:     None,
                             depth_usdc_at_decision: None,
                             entry_price:            Some(entry.entry_price),
-                            exit_price:             Some(entry.entry_price),
+                            exit_price:             Some(exit_price),
                             hold_sec:               Some(hold_sec),
                             model:                  format!("{}", model),
                             p_yes_at_entry:         Some(entry.p_yes_at_entry),
@@ -225,7 +248,7 @@ impl WeatherStrategy {
                             slippage_buffer_bps:    Some(self.sc.slippage_buffer_bps as i64),
                             expected_net_edge_bps:  Some(entry.expected_net_edge_bps),
                             realized_pnl_usdc:      Some(realized_pnl),
-                            reason_code:            "TIME_DECAY_EXIT".into(),
+                            reason_code:            action.into(),
                             note:                   Some("engine restart recovery".into()),
                             token_id:               entry.token_id,
                             close_ts:               entry.close_ts,
@@ -284,21 +307,23 @@ impl WeatherStrategy {
 
             exited_slugs.retain(|_, ts| ts.elapsed() < SLUG_COOLDOWN);
 
-            // ── Circuit-breaker gate ───────────────────────────────────────────
+            // ── 1. Monitor existing positions (always, even when circuit-breaker is active) ──
+            // Must run unconditionally so TIME_DECAY_EXIT / STOP_LOSS can close open
+            // positions even after the drawdown limit has been hit.
+            self.monitor_positions(&mut open_positions, db, effective_abort_sec, &mut exited_slugs).await;
+
+            // ── Circuit-breaker gate (blocks new entries only) ─────────────────
             {
                 let cap = self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() });
                 if cap.is_stopped() {
                     tracing::warn!(
-                        "[Weather:{}] ⛔ 停損觸發（capital={:.4}），暫停本輪掃描",
+                        "[Weather:{}] ⛔ 停損觸發（capital={:.4}），暫停新入場",
                         self.sc.id,
                         cap.current_capital,
                     );
                     continue;
                 }
             }
-
-            // ── 1. Monitor existing positions ──────────────────────────────────
-            self.monitor_positions(&mut open_positions, db, effective_abort_sec, &mut exited_slugs).await;
 
             // ── 2. Scan for new entries ────────────────────────────────────────
             match self.scan_for_entries(&open_positions, db, effective_abort_sec, &exited_slugs).await {
@@ -370,8 +395,7 @@ impl WeatherStrategy {
                             pos.p_yes_at_entry, realized_pnl, None,
                         ).await;
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), Some(settled_price), pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, realized_pnl);
                         self.tg("💰", "SETTLEMENT",
                             &format!("{} side={} settled={:.4} pnl={:+.4} USDC",
                                 pos.market_slug, pos.side, settled_price, realized_pnl)).await;
@@ -388,13 +412,23 @@ impl WeatherStrategy {
                     }
                 }
 
-                let realized_pnl = -self.global.compute_fee(pos.size_usdc);
+                // DRY_RUN: UMA oracle settles hours after close; use model probability as
+                // estimated settlement price so PnL reflects expected outcome, not just entry fee.
+                let model_settlement = if pos.side == "YES" {
+                    pos.p_yes_at_entry
+                } else {
+                    1.0 - pos.p_yes_at_entry
+                };
+                let realized_pnl = (model_settlement - pos.entry_price) * pos.size_usdc
+                    - self.global.compute_fee(pos.size_usdc) * 2.0;
                 tracing::info!(
-                    "[Weather:{}] TIME_DECAY_EXIT {} side={} secs_left={} hold={}s  pnl={:.4}",
-                    self.sc.id, pos.market_slug, pos.side, secs_to_close, hold_sec, realized_pnl
+                    "[Weather:{}] TIME_DECAY_EXIT {} side={} secs_left={} hold={}s  \
+                     model_settle={:.3}  pnl={:.4}",
+                    self.sc.id, pos.market_slug, pos.side, secs_to_close, hold_sec,
+                    model_settlement, realized_pnl
                 );
                 self.tg("⏰", "TIME_DECAY_EXIT",
-                    &format!("{} side={} hold={}s pnl={:+.4} USDC",
+                    &format!("{} side={} hold={}s est_pnl={:+.4} USDC",
                         pos.market_slug, pos.side, hold_sec, realized_pnl)).await;
                 if self.global.is_dry_run() {
                     self.write_exit(
@@ -402,8 +436,7 @@ impl WeatherStrategy {
                         pos.p_yes_at_entry, realized_pnl, None,
                     ).await;
                     self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                        .on_cycle_end(Some(pos.entry_price), None, pos.size_usdc,
-                                      self.global.compute_fee(pos.size_usdc));
+                        .on_weather_exit(pos.size_usdc, realized_pnl);
                     newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
                     continue;
@@ -421,11 +454,12 @@ impl WeatherStrategy {
                     }
                 };
                 let exit_price = book.best_bid;
+                let live_td_pnl = (exit_price - pos.entry_price) * pos.size_usdc
+                    - self.global.compute_fee(pos.size_usdc) * 2.0;
                 match self.submit_live_exit_order(pos, exit_price, db, "TIME_DECAY_EXIT").await {
                     Ok(()) => {
                         self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                            .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                          self.global.compute_fee(pos.size_usdc));
+                            .on_weather_exit(pos.size_usdc, live_td_pnl);
                         newly_exited.push(pos.market_slug.clone());
                         to_remove.push(idx);
                     }
@@ -506,8 +540,7 @@ impl WeatherStrategy {
                     continue;
                 }
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                    .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                  self.global.compute_fee(pos.size_usdc));
+                    .on_weather_exit(pos.size_usdc, realized_pnl);
                 self.tg("💚", "TAKE_PROFIT",
                     &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
                         pos.market_slug, pos.side, exit_price, realized_pnl)).await;
@@ -564,8 +597,7 @@ impl WeatherStrategy {
                     continue;
                 }
                 self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                    .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                  self.global.compute_fee(pos.size_usdc));
+                    .on_weather_exit(pos.size_usdc, realized_pnl);
                 self.tg("🔴", "STOP_LOSS",
                     &format!("{} side={} exit={:.4} pnl={:+.4} USDC",
                         pos.market_slug, pos.side, exit_price, realized_pnl)).await;
@@ -686,6 +718,14 @@ impl WeatherStrategy {
                 if direction_flipped || p_yes_shifted {
                     let hold_sec = now_ts as i64 - pos.entry_ts;
                     let exit_price = book.best_bid; // sell at bid
+                    if exit_price <= 0.0 {
+                        // 無買盤，無法以合理價格出場；等待結算或 TIME_DECAY_EXIT
+                        tracing::warn!(
+                            "[Weather:{}] FORECAST_SHIFT {} 無買盤 (best_bid=0)，保留持倉等待結算",
+                            self.sc.id, pos.market_slug
+                        );
+                        continue;
+                    }
                     let realized_pnl = (exit_price - pos.entry_price) * pos.size_usdc
                         - self.global.compute_fee(pos.size_usdc) * 2.0;
                     tracing::info!(
@@ -711,8 +751,7 @@ impl WeatherStrategy {
                         continue;
                     }
                     self.capital.lock().unwrap_or_else(|e| { tracing::error!("[Mutex Poisoned] capital: {e}"); e.into_inner() })
-                        .on_cycle_end(Some(pos.entry_price), Some(exit_price), pos.size_usdc,
-                                      self.global.compute_fee(pos.size_usdc));
+                        .on_weather_exit(pos.size_usdc, realized_pnl);
                     newly_exited.push(pos.market_slug.clone());
                     to_remove.push(idx);
                     continue;
@@ -790,7 +829,14 @@ impl WeatherStrategy {
                 let secs_to_close = market.close_ts.saturating_sub(now_ts);
                 if secs_to_close > METAR_SHORT_MAX_TTE_SEC {
                     tracing::debug!(
-                        "[Weather:{}] {} metar_short 僅交易 24h 內市場，跳過 tte={}s",
+                        "[Weather:{}] {} metar_short 跳過：距收盤 {}s > 24h 上限",
+                        self.sc.id, market.slug, secs_to_close
+                    );
+                    continue;
+                }
+                if secs_to_close < METAR_SHORT_MIN_TTE_SEC {
+                    tracing::debug!(
+                        "[Weather:{}] {} metar_short 跳過：距收盤 {}s < 1h 下限，TIME_DECAY_EXIT 風險過高",
                         self.sc.id, market.slug, secs_to_close
                     );
                     continue;
@@ -1349,7 +1395,7 @@ async fn fetch_forecasts_for_cities(
     result
 }
 
-async fn fetch_consensus_forecasts_for_cities(
+pub(crate) async fn fetch_consensus_forecasts_for_cities(
     cities: &HashSet<String>,
     forecast_days: u32,
 ) -> HashMap<String, ConsensusCityForecasts> {
@@ -1453,7 +1499,7 @@ async fn fetch_city_forecast_cached(
     }
 }
 
-fn evaluate_consensus_signal_for_market(
+pub(crate) fn evaluate_consensus_signal_for_market(
     city_fc: &ConsensusCityForecasts,
     market: &WeatherMarket,
     snapshot: &WeatherBookSnapshot,
@@ -1728,7 +1774,7 @@ fn evaluate_consensus_signal_for_market(
     }
 }
 
-fn parse_weather_model(model: &str) -> WeatherModel {
+pub(crate) fn parse_weather_model(model: &str) -> WeatherModel {
     if model.eq_ignore_ascii_case("ecmwf") {
         WeatherModel::Ecmwf
     } else if model.eq_ignore_ascii_case("ensemble") {

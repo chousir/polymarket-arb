@@ -1,19 +1,10 @@
 # Polymarket 自動交易系統
 
-針對 Polymarket BTC 15 分鐘 Up/Down 市場的自動套利系統。Rust 引擎負責即時監控與訂單執行，Python 負責回測分析與儀表板。
+科學氣象模型 vs 群眾直覺的套利系統。Rust 引擎負責即時氣象預報拉取、訂單簿監控與訂單執行，Python 負責回測分析與儀表板。
 
 ---
 
 ## 策略說明
-
-### Dump-Hedge（兩腿）
-1. **Leg 1**：偵測 BTC 急跌（`dump_threshold_pct`），先入場 Down 單
-2. **Leg 2**：等待 Up + Down 總價格 < `hedge_threshold_sum` 時對沖另一腿
-3. 目的：鎖定價差、限制單腿暴露時間
-
-### Pure-Arb（即時雙腿）
-- 不等急跌訊號，直接監控 `hedge_threshold_sum`
-- 出現折價時同時買入兩腿
 
 ### 交易模式
 | 模式 | 說明 |
@@ -27,14 +18,15 @@
 
 | 參數 | 說明 |
 |------|------|
-| `dump_threshold_pct` | BTC 急跌觸發門檻（%） |
-| `hedge_threshold_sum` | Up+Down 總和折價門檻，低於此值才對沖 |
 | `capital_allocation_pct` | 該策略使用總資金比例 |
 | `trade_size_pct` | 每次下注比例（動態隨資金調整） |
 | `max_drawdown_pct` | 達到此回撤上限時停止入場 |
+| `min_net_edge_bps` | 最低入場邊際（扣除雙邊 taker fee 後） |
+| `stop_loss_delta` | 止損距離（lead_days ≥ 1 時自動 ×2） |
+| `forecast_shift_threshold` | 預測偏移強制退出門檻（lead_days ≥ 1 時自動 ×2） |
 | `enabled` | 是否啟用此策略 |
 
-費用提醒：`hedge_threshold_sum` 必須扣除雙邊 taker fee（最高 1.8%）才能確保獲利空間。
+費用提醒：`min_net_edge_bps` 必須扣除雙邊 taker fee（最高 1.8%）才能確保獲利空間。
 
 ---
 
