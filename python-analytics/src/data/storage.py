@@ -270,6 +270,117 @@ class DbReader:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_cycle(r) for r in rows]
 
+    # ── Weather action / rejection aggregates ─────────────────────────────────
+
+    def get_weather_action_counts(
+        self,
+        days: Optional[int] = None,
+        strategy_id: Optional[str] = None,
+    ) -> dict[str, int]:
+        """Return {action: count} for weather_dry_run_trades in window."""
+        conditions = []
+        params: list = []
+        if days is not None:
+            conditions.append("ts >= datetime('now', ?)")
+            params.append(f"-{days} days")
+        if strategy_id is not None:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT action, COUNT(*) FROM weather_dry_run_trades {where} GROUP BY action"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
+    def get_weather_rejection_breakdown(
+        self,
+        days: Optional[int] = None,
+        strategy_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Return [{reason_code, count, pct}, ...] for NO_TRADE rows, ordered desc."""
+        conditions = ["action = 'NO_TRADE'"]
+        params: list = []
+        if days is not None:
+            conditions.append("ts >= datetime('now', ?)")
+            params.append(f"-{days} days")
+        if strategy_id is not None:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+        where = "WHERE " + " AND ".join(conditions)
+        sql = (
+            f"SELECT reason_code, COUNT(*) FROM weather_dry_run_trades {where} "
+            f"GROUP BY reason_code ORDER BY COUNT(*) DESC LIMIT ?"
+        )
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        total = sum(int(r[1]) for r in rows) or 1
+        return [
+            {"reason_code": r[0] or "UNKNOWN", "count": int(r[1]),
+             "pct": round(int(r[1]) / total, 6)}
+            for r in rows
+        ]
+
+    def get_weather_unresolved_entries(
+        self,
+        days: Optional[int] = None,
+        strategy_id: Optional[str] = None,
+    ) -> dict:
+        """Return {unresolved, total_entries, settled, exit_breakdown}.
+
+        Unresolved = ENTRY rows whose market_slug has no exit row
+        (TAKE_PROFIT/STOP_LOSS/FORECAST_SHIFT/TIME_DECAY_EXIT/SETTLEMENT).
+        """
+        conditions = []
+        params: list = []
+        if days is not None:
+            conditions.append("ts >= datetime('now', ?)")
+            params.append(f"-{days} days")
+        if strategy_id is not None:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        exit_actions = ("TAKE_PROFIT", "STOP_LOSS", "FORECAST_SHIFT",
+                        "TIME_DECAY_EXIT", "SETTLEMENT")
+        placeholders = ",".join(["?"] * len(exit_actions))
+
+        sql_entries = (
+            f"SELECT COUNT(DISTINCT market_slug) FROM weather_dry_run_trades "
+            f"{where} {'AND' if conditions else 'WHERE'} action = 'ENTRY'"
+        )
+        sql_settled = (
+            f"SELECT COUNT(DISTINCT market_slug) FROM weather_dry_run_trades "
+            f"{where} {'AND' if conditions else 'WHERE'} action IN ({placeholders})"
+        )
+        sql_exit_breakdown = (
+            f"SELECT action, COUNT(*) FROM weather_dry_run_trades "
+            f"{where} {'AND' if conditions else 'WHERE'} action IN ({placeholders}) "
+            f"GROUP BY action"
+        )
+        with self._connect() as conn:
+            total_entries = int(conn.execute(sql_entries, params).fetchone()[0] or 0)
+            settled = int(conn.execute(
+                sql_settled, params + list(exit_actions)
+            ).fetchone()[0] or 0)
+            exit_rows = conn.execute(
+                sql_exit_breakdown, params + list(exit_actions)
+            ).fetchall()
+
+        exit_breakdown = {r[0]: int(r[1]) for r in exit_rows}
+        unresolved = max(0, total_entries - settled)
+        return {
+            "total_entries": total_entries,
+            "settled": settled,
+            "unresolved": unresolved,
+            "settlement_coverage_pct": (settled / total_entries) if total_entries else 0.0,
+            "settlement_official_pct": (
+                exit_breakdown.get("SETTLEMENT", 0) / total_entries
+            ) if total_entries else 0.0,
+            "exit_breakdown": exit_breakdown,
+        }
+
     # ── Strategy index ────────────────────────────────────────────────────────
 
     def get_strategy_ids(self) -> list[str]:

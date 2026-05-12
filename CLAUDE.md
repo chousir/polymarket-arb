@@ -85,3 +85,13 @@ LOG_LEVEL=info
 ## 開發階段
 目前：天氣策略驗證中（dry_run）
 進入 live 的最低條件：dry_run ≥ 7 天、勝率 ≥ 60%、單輪最大虧損 < 25%
+
+## 診斷工具（python-analytics/src/analytics/）
+- `gate_sensitivity`：閘門敏感度分析（哪一道擋掉最多、放寬效益估算）
+- `strategy_diagnosis`：分群分析（by strategy / model / city / lead_days / p_yes）
+- `strategy_recommender`：根據分群結果產出改進建議（不直接改 settings.toml）
+
+## 結算回補
+- Rust 引擎啟動會自動啟動 SettlementReconciler 任務（每 30 分鐘掃描）
+- 一次性回補：`python tools/backfill_settlements.py --apply`
+- 新表：`polymarket_trades_external`（從 data-api.polymarket.com 拉自有錢包交易）

@@ -352,6 +352,69 @@ impl DbWriter {
         .unwrap_or_default()
     }
 
+    /// Returns ENTRY rows across ALL strategies that have no corresponding exit row
+    /// (SETTLEMENT/TAKE_PROFIT/STOP_LOSS/FORECAST_SHIFT/TIME_DECAY_EXIT) AND whose
+    /// market has already closed (close_ts <= now). Used by SettlementReconciler.
+    pub async fn load_unresolved_closed_weather_entries(&self) -> Vec<OpenWeatherEntry> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap_or_else(|e| {
+                tracing::error!("[Mutex Poisoned] SQLite conn: {e}");
+                e.into_inner()
+            });
+            let now_ts = chrono::Utc::now().timestamp();
+            let mut stmt = match conn.prepare(
+                "SELECT e.strategy_id, e.event_id, e.market_slug, e.city, e.market_type, \
+                        e.side, e.price, e.size_usdc, e.token_id, e.close_ts, \
+                        COALESCE(e.p_yes_at_entry, 0.5), COALESCE(e.lead_days, 0), \
+                        COALESCE(e.expected_net_edge_bps, 0.0), e.model, \
+                        CAST(strftime('%s', e.ts) AS INTEGER) \
+                 FROM weather_dry_run_trades e \
+                 WHERE e.action = 'ENTRY' AND e.close_ts > 0 AND e.close_ts <= ?1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM weather_dry_run_trades x \
+                       WHERE x.event_id = e.event_id \
+                         AND x.action IN ('SETTLEMENT','TAKE_PROFIT','STOP_LOSS', \
+                                          'FORECAST_SHIFT','TIME_DECAY_EXIT') \
+                   )",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("[DB] load_unresolved_closed_weather_entries prepare failed: {e}");
+                    return Vec::new();
+                }
+            };
+            let rows = stmt.query_map([now_ts], |row| {
+                Ok(OpenWeatherEntry {
+                    strategy_id:           row.get(0)?,
+                    event_id:              row.get(1)?,
+                    market_slug:           row.get(2)?,
+                    city:                  row.get(3)?,
+                    market_type:           row.get(4)?,
+                    side:                  row.get(5)?,
+                    entry_price:           row.get(6)?,
+                    size_usdc:             row.get(7)?,
+                    token_id:              row.get(8)?,
+                    close_ts:              row.get(9)?,
+                    p_yes_at_entry:        row.get(10)?,
+                    lead_days:             row.get(11)?,
+                    expected_net_edge_bps: row.get(12)?,
+                    model:                 row.get(13)?,
+                    entry_ts:              row.get(14).unwrap_or(0),
+                })
+            });
+            match rows {
+                Ok(mapped) => mapped.flatten().collect(),
+                Err(e) => {
+                    tracing::error!("[DB] load_unresolved_closed_weather_entries query failed: {e}");
+                    Vec::new()
+                }
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     pub async fn write_weather_ladder_trade(
         &self,
         trade: &WeatherLadderTrade,

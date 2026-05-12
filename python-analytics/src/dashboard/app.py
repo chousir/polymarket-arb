@@ -130,68 +130,157 @@ def _load_weather_ladder_strategy_ids() -> list[str]:
 
 
 def _build_stats(days: int = 1, strategy_id: Optional[str] = None) -> dict:
-    """Summary for a given strategy (or all strategies if strategy_id is None)."""
+    """Summary across all sources. trigger_rate now uses ENTRY/(ENTRY+NO_TRADE)
+    from weather_dry_run_trades (the active strategy family) when available,
+    so weather策略不會被 cycle_results 騙人的 100% 失真。"""
     r = _reader()
     cycles = r.get_cycle_results(days=days, strategy_id=strategy_id)
     triggered = [c for c in cycles if c.leg1_price is not None]
     resolved = [c for c in triggered if c.pnl_usdc is not None]
-    pnl_series = [c.pnl_usdc for c in resolved]  # type: ignore[misc]
-    wr = win_rate(pnl_series) if pnl_series else 0.0
+    pnl_series_cycles = [c.pnl_usdc for c in resolved]  # type: ignore[misc]
 
     trades = r.get_dry_run_trades(days=days, strategy_id=strategy_id)
     total_invested = sum(t.size_usdc for t in trades)
     total_fees = sum(t.fee_usdc for t in trades)
 
+    weather_actions = r.get_weather_action_counts(days=days, strategy_id=strategy_id)
+    weather_entries = weather_actions.get("ENTRY", 0)
+    weather_no_trade = weather_actions.get("NO_TRADE", 0)
+    weather_signals = weather_entries + weather_no_trade
+
+    weather_exits = (
+        weather_actions.get("TAKE_PROFIT", 0)
+        + weather_actions.get("STOP_LOSS", 0)
+        + weather_actions.get("FORECAST_SHIFT", 0)
+        + weather_actions.get("TIME_DECAY_EXIT", 0)
+        + weather_actions.get("SETTLEMENT", 0)
+    )
+
+    weather_trades = r.get_weather_dry_run_trades(days=days, strategy_id=strategy_id)
+    weather_pnl_series = [
+        t.realized_pnl_usdc for t in weather_trades
+        if t.action in ("TAKE_PROFIT", "STOP_LOSS", "FORECAST_SHIFT",
+                        "TIME_DECAY_EXIT", "SETTLEMENT")
+        and t.realized_pnl_usdc is not None
+    ]
+
+    combined_pnl = pnl_series_cycles + weather_pnl_series
+    wr = win_rate(combined_pnl) if combined_pnl else 0.0
+
+    unresolved = r.get_weather_unresolved_entries(days=days, strategy_id=strategy_id)
+
+    if weather_signals > 0:
+        primary_trigger_rate = weather_entries / weather_signals
+        trigger_rate_source = "weather_dry_run_trades"
+    elif cycles:
+        primary_trigger_rate = len(triggered) / len(cycles)
+        trigger_rate_source = "cycle_results"
+    else:
+        primary_trigger_rate = 0.0
+        trigger_rate_source = "n/a"
+
     return {
         "strategy_id": strategy_id or "all",
         "total_cycles": len(cycles),
         "triggered_cycles": len(triggered),
-        "trigger_rate": len(triggered) / len(cycles) if cycles else 0.0,
+        "trigger_rate": primary_trigger_rate,
+        "trigger_rate_source": trigger_rate_source,
+        "weather_entries": weather_entries,
+        "weather_no_trade": weather_no_trade,
+        "weather_exits": weather_exits,
+        "weather_settled_official": weather_actions.get("SETTLEMENT", 0),
+        "weather_unresolved_entries": unresolved["unresolved"],
+        "settlement_coverage_pct": unresolved["settlement_coverage_pct"],
+        "settlement_official_pct": unresolved["settlement_official_pct"],
         "win_rate": wr,
-        "total_pnl_usdc": sum(pnl_series),
-        "total_invested_usdc": total_invested,
+        "total_pnl_usdc": sum(pnl_series_cycles) + sum(weather_pnl_series),
+        "total_invested_usdc": total_invested
+            + sum(t.size_usdc for t in weather_trades if t.action == "ENTRY"),
         "total_fees_usdc": total_fees,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def _build_strategy_table(days: int = 7) -> list[dict]:
-    """Per-strategy summary table for the dashboard overview."""
+    """Per-strategy summary table for the dashboard overview.
+
+    觸發率優先使用 weather_dry_run_trades 的 ENTRY/(ENTRY+NO_TRADE)；
+    若該 strategy_id 沒有 weather 紀錄，退回 cycle_results.leg1_price 邏輯。
+    """
     r = _reader()
     cycles = r.get_cycle_results(days=days)
     trades = r.get_dry_run_trades(days=days)
+    weather_trades_all = r.get_weather_dry_run_trades(days=days)
     cap_cfg = _load_strategy_capital_config()
 
     by_strategy_cycles: dict[str, list[CycleResult]] = defaultdict(list)
     by_strategy_trades: dict[str, list[DryRunTrade]] = defaultdict(list)
+    by_strategy_weather: dict[str, list[WeatherDryRunTrade]] = defaultdict(list)
 
     for c in cycles:
         by_strategy_cycles[c.strategy_id].append(c)
     for t in trades:
         by_strategy_trades[t.strategy_id].append(t)
+    for w in weather_trades_all:
+        by_strategy_weather[w.strategy_id].append(w)
 
-    all_ids = sorted(set(by_strategy_cycles) | set(by_strategy_trades))
+    all_ids = sorted(set(by_strategy_cycles) | set(by_strategy_trades) | set(by_strategy_weather))
     result = []
     for sid in all_ids:
         scycles = by_strategy_cycles[sid]
         strades = by_strategy_trades[sid]
+        weather_rows = by_strategy_weather[sid]
+
+        entries = [w for w in weather_rows if w.action == "ENTRY"]
+        no_trades = [w for w in weather_rows if w.action == "NO_TRADE"]
+        exit_rows = [w for w in weather_rows if w.action in (
+            "TAKE_PROFIT", "STOP_LOSS", "FORECAST_SHIFT",
+            "TIME_DECAY_EXIT", "SETTLEMENT")]
+        weather_pnl = [w.realized_pnl_usdc for w in exit_rows
+                       if w.realized_pnl_usdc is not None]
+        exited_slugs = {w.market_slug for w in exit_rows}
+        weather_unresolved = sum(
+            1 for w in entries if w.market_slug not in exited_slugs
+        )
+
         triggered = [c for c in scycles if c.leg1_price is not None]
         resolved = [c for c in triggered if c.pnl_usdc is not None]
-        pnl_series = [c.pnl_usdc for c in resolved]  # type: ignore[misc]
-        total_invested = sum(t.size_usdc for t in strades)
+        cycle_pnl_series = [c.pnl_usdc for c in resolved]  # type: ignore[misc]
+
+        combined_pnl = cycle_pnl_series + weather_pnl
+        total_invested = (
+            sum(t.size_usdc for t in strades)
+            + sum(w.size_usdc for w in entries)
+        )
         total_fees = sum(t.fee_usdc for t in strades)
-        total_pnl = sum(pnl_series)
+        total_pnl = sum(combined_pnl)
         cfg = cap_cfg.get(sid, {})
         initial_allocated = float(cfg.get("initial_allocated_usdc", 0.0) or 0.0)
-        wr = win_rate(pnl_series) if pnl_series else 0.0
+        wr = win_rate(combined_pnl) if combined_pnl else 0.0
         pnl_pct_alloc = (total_pnl / initial_allocated) if initial_allocated > 0 else 0.0
         pnl_pct_invested = (total_pnl / total_invested) if total_invested > 0 else 0.0
+
+        if entries or no_trades:
+            signals = len(entries) + len(no_trades)
+            trig_rate = len(entries) / signals if signals else 0.0
+            trig_source = "weather"
+        elif scycles:
+            trig_rate = len(triggered) / len(scycles)
+            trig_source = "cycles"
+        else:
+            trig_rate = 0.0
+            trig_source = "n/a"
+
         result.append({
             "strategy_id": sid,
             "total_cycles": len(scycles),
             "triggered_cycles": len(triggered),
             "total_trades": len(strades),
-            "trigger_rate": len(triggered) / len(scycles) if scycles else 0.0,
+            "trigger_rate": trig_rate,
+            "trigger_rate_source": trig_source,
+            "weather_entries": len(entries),
+            "weather_no_trade": len(no_trades),
+            "weather_unresolved": weather_unresolved,
             "win_rate": wr,
             "total_pnl_usdc": total_pnl,
             "total_invested_usdc": total_invested,
@@ -478,9 +567,9 @@ def health_check():
 
 
 @app.get("/api/stats")
-def get_stats(strategy_id: Optional[str] = None):
-    """今日總覽。可加 ?strategy_id=xxx 篩選單一策略。"""
-    return _build_stats(days=1, strategy_id=strategy_id)
+def get_stats(strategy_id: Optional[str] = None, days: int = 1):
+    """總覽。可加 ?strategy_id=xxx 篩選單一策略，?days=N 切換視窗（預設 1 天）。"""
+    return _build_stats(days=days, strategy_id=strategy_id)
 
 
 @app.get("/api/strategies")
@@ -851,6 +940,89 @@ def get_weather_strategies(days: int = 7):
 def get_weather_strategy_detail(strategy_id: str, days: int = 30):
     """單一 weather 策略詳情（與 /api/mention/strategy-detail 結構對稱）。"""
     return _build_weather_strategy_detail(strategy_id=strategy_id, days=days)
+
+
+@app.get("/api/weather/diagnosis")
+def get_weather_diagnosis(days: int = 90, dimension: Optional[str] = None):
+    """策略分群診斷：by strategy_id / model / city / market_type / side /
+    action / lead_days_bucket / p_yes_at_entry_bucket。
+
+    若指定 dimension 只回該維度。
+    """
+    try:
+        from src.analytics.strategy_diagnosis import run
+        rep = dataclasses.asdict(run(_db_path(), days))
+        if dimension and dimension in rep["groups"]:
+            rep["groups"] = {dimension: rep["groups"][dimension]}
+        return rep
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/weather/recommendations")
+def get_weather_recommendations(days: int = 90):
+    """根據 diagnosis 結果產出的策略改進建議清單。"""
+    try:
+        from src.analytics.strategy_diagnosis import run
+        from src.analytics.strategy_recommender import generate
+        report = run(_db_path(), days)
+        recs = generate(report)
+        return {
+            "days": days,
+            "total_resolved": report.total_resolved,
+            "overall_win_rate": report.overall_win_rate,
+            "overall_avg_pnl_per_usd": report.overall_avg_pnl_per_usd,
+            "recommendations": [dataclasses.asdict(r) for r in recs],
+        }
+    except Exception as e:
+        return {"error": str(e), "recommendations": []}
+
+
+@app.get("/api/weather/gate-sensitivity")
+def get_weather_gate_sensitivity(days: int = 30, strategy_id: Optional[str] = None):
+    """敏感度分析：每個閘門放寬後能多解鎖多少訊號，含基線勝率參考。
+
+    回傳 GateReport（含 scenarios list）。
+    """
+    try:
+        from src.analytics.gate_sensitivity import run
+        return dataclasses.asdict(run(_db_path(), days, strategy_id))
+    except Exception as e:
+        return {"error": str(e), "scenarios": []}
+
+
+@app.get("/api/weather/rejection-breakdown")
+def get_weather_rejection_breakdown(
+    days: int = 7,
+    strategy_id: Optional[str] = None,
+    limit: int = 20,
+):
+    """NO_TRADE rejection reasons ranked by count（識別哪一道閘門擋掉最多訊號）。
+
+    回傳：
+      [{reason_code, count, pct}, ...]
+    """
+    try:
+        r = _reader()
+        return r.get_weather_rejection_breakdown(
+            days=days, strategy_id=strategy_id, limit=limit
+        )
+    except Exception as e:
+        return {"error": str(e), "items": []}
+
+
+@app.get("/api/weather/unresolved")
+def get_weather_unresolved(days: int = 30, strategy_id: Optional[str] = None):
+    """ENTRY 但未結算的市場統計（修復前 77% 未結算問題的追蹤指標）。
+
+    回傳：{total_entries, settled, unresolved, settlement_coverage_pct,
+            settlement_official_pct, exit_breakdown}
+    """
+    try:
+        r = _reader()
+        return r.get_weather_unresolved_entries(days=days, strategy_id=strategy_id)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/weather/trades")

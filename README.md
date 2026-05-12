@@ -151,6 +151,49 @@ python -m src.backtest.engine --days 7 --db ../data/market_snapshots.db
 python -m src.strategy.optimizer --db ../data/market_snapshots.db --days 7
 ```
 
+### 診斷與改進分析
+
+```bash
+cd python-analytics
+
+# 閘門敏感度：哪一道閘門擋掉最多訊號、放寬閾值能多解鎖多少
+python -m src.analytics.gate_sensitivity --days 30
+
+# 分群診斷：by strategy / model / city / lead_days / p_yes 區段
+python -m src.analytics.strategy_diagnosis --days 90
+python -m src.analytics.strategy_diagnosis --days 90 --markdown > diagnosis.md
+
+# 自動改進建議（讀人類審閱用，不會自動改 settings.toml）
+python -m src.analytics.strategy_recommender --days 90 > recommendations.md
+```
+
+### 結算補齊
+
+```bash
+# 從 Polymarket Gamma API 補齊未結算 ENTRY 的 SETTLEMENT 紀錄
+python tools/backfill_settlements.py --db data/market_snapshots.db --days 90       # 預覽
+python tools/backfill_settlements.py --db data/market_snapshots.db --days 90 --apply
+```
+（Rust 引擎啟動時也會自動跑 `SettlementReconciler` 每 30 分鐘掃描一次。）
+
+### 拉取錢包真實交易（live 模式）
+
+```bash
+python -m src.data.polymarket_history --persist
+# 寫入 polymarket_trades_external 表，與本地 dry_run_trades 對比驗證
+```
+
+### 儀表板新端點
+
+| 端點 | 用途 |
+|---|---|
+| `/api/stats` | 真實觸發率、未結算指標、結算覆蓋率 |
+| `/api/weather/rejection-breakdown` | NO_TRADE 拒絕原因排名 |
+| `/api/weather/unresolved` | 未結算 ENTRY 統計 |
+| `/api/weather/gate-sensitivity` | 閘門敏感度分析 |
+| `/api/weather/diagnosis?dimension=city` | 分群診斷 |
+| `/api/weather/recommendations` | 自動改進建議清單 |
+
 ---
 
 ## 專案結構

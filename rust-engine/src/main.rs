@@ -242,6 +242,18 @@ async fn main() -> Result<(), AppError> {
         });
     }
 
+    // ── 10b. Spawn SettlementReconciler (補結算未結算 ENTRY) ───────────────────
+    {
+        let global = config.clone();
+        let db = db.clone();
+        tracing::info!("[SettlementReconciler] 啟動補結算背景任務");
+        tokio::spawn(async move {
+            strategy::settlement_reconciler::SettlementReconciler::new(global, db)
+                .run_loop()
+                .await;
+        });
+    }
+
     // ── 11. Spawn Mention strategies as independent background tasks ──────────
     {
         let mention_strategies: Vec<_> = config

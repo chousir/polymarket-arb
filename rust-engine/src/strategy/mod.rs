@@ -4,6 +4,7 @@ pub mod mention_executor;
 pub mod mention_filter;
 pub mod pure_arb;
 pub mod settlement;
+pub mod settlement_reconciler;
 pub mod signal;
 pub mod weather_decision;
 pub mod weather_executor;
